@@ -1,0 +1,14 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+.env
+.env.*
+!.env.example
+
+# Connection List exports are credential dumps
+*.opendb
+*connections*.json
+
+.DS_Store
+.netlify
