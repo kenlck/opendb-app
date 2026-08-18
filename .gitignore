@@ -12,3 +12,6 @@ Cargo.lock.bak
 
 .DS_Store
 .netlify
+
+.scratch/
+
