@@ -1,3 +1,5 @@
+mod session;
+
 use std::fs;
 
 use directories::ProjectDirs;
@@ -7,10 +9,8 @@ use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputState};
 use gpui_component::{ActiveTheme, Root, h_flex, v_flex};
 use gpui_component_assets::Assets;
-use opendb::{
-    AddResult, Client, Connection, ConnectionList, ConnectionString, FileStore, SessionId,
-    SystemCatalogPreference,
-};
+use opendb::{AddResult, Client, Connection, ConnectionList, ConnectionString, FileStore};
+use session::SessionView;
 
 pub struct ConnectionListView {
     client: Entity<Client>,
@@ -135,7 +135,7 @@ impl ConnectionListView {
                 let name = connection.name().as_str().to_string();
                 let options = session_window_options(&name, cx);
                 if let Err(err) = cx.open_window(options, |window, cx| {
-                    let view = cx.new(|cx| SessionView::new(client, session_id, cx));
+                    let view = cx.new(|cx| SessionView::new(client, session_id, window, cx));
                     cx.new(|cx| Root::new(view, window, cx))
                 }) {
                     self.status = format!("{err}").into();
@@ -208,97 +208,6 @@ impl Render for ConnectionListView {
     }
 }
 
-struct SessionView {
-    client: Entity<Client>,
-    session_id: SessionId,
-    status: SharedString,
-}
-
-impl SessionView {
-    fn new(client: Entity<Client>, session_id: SessionId, cx: &mut Context<Self>) -> Self {
-        cx.observe(&client, |_, _, cx| cx.notify()).detach();
-        cx.on_release(|this, cx| {
-            this.client.update(cx, |client, _cx| {
-                client.close_session(this.session_id);
-            });
-        })
-        .detach();
-        Self {
-            client,
-            session_id,
-            status: SharedString::default(),
-        }
-    }
-
-    fn toggle_system_catalogs(&mut self, cx: &mut Context<Self>) {
-        let result = self.client.update(cx, |client, cx| {
-            let next = client.show_system_catalogs().toggled();
-            let result = client.set_show_system_catalogs(next);
-            cx.notify();
-            result
-        });
-        if let Err(err) = result {
-            self.status = format!("{err}").into();
-        }
-        cx.notify();
-    }
-}
-
-impl Render for SessionView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let (shown, title, table_names) = {
-            let client = self.client.read(cx);
-            let shown = client.show_system_catalogs() == SystemCatalogPreference::Shown;
-            let title = client
-                .session_name(self.session_id)
-                .map(|name| name.as_str().to_string())
-                .unwrap_or_else(|_| "Session".into());
-            let table_names = match client.tables(self.session_id) {
-                Ok(catalog) => Ok(catalog
-                    .tables()
-                    .iter()
-                    .map(|table| table.name().as_str().to_string())
-                    .collect::<Vec<_>>()),
-                Err(err) => Err(format!("{err}")),
-            };
-            (shown, title, table_names)
-        };
-
-        let mut tables = v_flex().gap_1();
-        match table_names {
-            Ok(names) if names.is_empty() => {
-                tables = tables.child("No Tables.");
-            }
-            Ok(names) => {
-                for (index, name) in names.into_iter().enumerate() {
-                    tables = tables.child(Button::new(("table", index as u64)).label(name));
-                }
-            }
-            Err(err) => {
-                tables = tables.child(err);
-            }
-        }
-
-        v_flex()
-            .size_full()
-            .p_5()
-            .gap_3()
-            .bg(cx.theme().background)
-            .child(title)
-            .child(
-                Button::new("system-catalogs")
-                    .label(if shown {
-                        "Hide System Catalogs"
-                    } else {
-                        "Show System Catalogs"
-                    })
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_system_catalogs(cx))),
-            )
-            .child(tables)
-            .child(self.status.clone())
-    }
-}
-
 fn app_data_dir() -> std::path::PathBuf {
     let dirs = ProjectDirs::from("dev", "OpenDB", "opendb").expect("app data directory");
     dirs.data_dir().to_path_buf()
@@ -314,7 +223,7 @@ fn preferences_path() -> std::path::PathBuf {
 
 fn session_window_options(name: &str, cx: &App) -> WindowOptions {
     WindowOptions {
-        window_bounds: Some(WindowBounds::centered(size(px(720.), px(520.)), cx)),
+        window_bounds: Some(WindowBounds::centered(size(px(960.), px(640.)), cx)),
         titlebar: Some(TitlebarOptions {
             title: Some(name.into()),
             ..Default::default()
