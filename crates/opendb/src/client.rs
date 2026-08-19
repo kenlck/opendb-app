@@ -1041,6 +1041,57 @@ mod tests {
     }
 
     #[test]
+    fn apply_sends_the_whole_session_bag() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("shop.db");
+        let connection = rusqlite::Connection::open(&db_path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT);
+                 INSERT INTO users (name) VALUES ('ken');
+                 CREATE TABLE notes (id INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT);
+                 INSERT INTO notes (body) VALUES ('hello');",
+            )
+            .unwrap();
+        drop(connection);
+        let mut client = Client::open(dir.path().join("preferences.json")).unwrap();
+        let id = client.open_session(&connection_at(&db_path)).unwrap();
+        client
+            .stage_insert(
+                id,
+                users(),
+                vec![(ColumnName::new("name".into()), Cell::Text("ada".into()))],
+            )
+            .unwrap();
+        client
+            .stage_insert(
+                id,
+                notes(),
+                vec![(ColumnName::new("body".into()), Cell::Text("world".into()))],
+            )
+            .unwrap();
+        assert_eq!(client.staged_changes(id).unwrap().len(), 2);
+        client.apply(id).unwrap();
+        let users_after = client.table_page(id, &users(), &[], Page::first()).unwrap();
+        let notes_after = client.table_page(id, &notes(), &[], Page::first()).unwrap();
+        assert_eq!(
+            users_after.rows(),
+            [
+                [Cell::Integer(1), Cell::Text("ken".into())],
+                [Cell::Integer(2), Cell::Text("ada".into())]
+            ]
+        );
+        assert_eq!(
+            notes_after.rows(),
+            [
+                [Cell::Integer(1), Cell::Text("hello".into())],
+                [Cell::Integer(2), Cell::Text("world".into())]
+            ]
+        );
+        assert!(client.staged_changes(id).unwrap().is_empty());
+    }
+
+    #[test]
     fn read_query_runs_immediately_and_is_paged() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("shop.db");
