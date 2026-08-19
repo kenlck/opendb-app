@@ -7,10 +7,11 @@ use serde::{Deserialize, Serialize};
 use crate::catalog::{SystemCatalogPreference, assemble, classify};
 use crate::connection::Connection;
 use crate::connection_string::Engine;
-use crate::engine::{Database, SqliteDatabase, SqliteOpenError};
+use crate::engine::{ApplyEngineError, Database, SqliteDatabase, SqliteOpenError};
 use crate::name::Name;
+use crate::staged::{ApplyError, StageError, StagedChange, StagedChangeId};
 use crate::table::{TableCatalog, TableName};
-use crate::table_page::{Filter, Page, TablePage};
+use crate::table_page::{Cell, ColumnName, Filter, Page, TablePage};
 
 pub struct Client {
     preferences_path: PathBuf,
@@ -26,6 +27,8 @@ struct Session {
     id: SessionId,
     name: Name,
     database: Box<dyn Database>,
+    staged: Vec<StagedChange>,
+    next_change_id: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -131,6 +134,8 @@ impl Client {
             id,
             name: connection.name().clone(),
             database,
+            staged: Vec::new(),
+            next_change_id: 1,
         });
         Ok(id)
     }
@@ -175,11 +180,115 @@ impl Client {
             .map_err(|error| CatalogError::Database(error.to_string()))
     }
 
+    pub fn stage_insert(
+        &mut self,
+        id: SessionId,
+        table: TableName,
+        values: Vec<(ColumnName, Cell)>,
+    ) -> Result<StagedChangeId, StageError> {
+        let session = self.session_mut(id)?;
+        let change_id = StagedChangeId::new(session.next_change_id);
+        session.next_change_id += 1;
+        session.staged.push(StagedChange::Insert {
+            id: change_id,
+            table,
+            values,
+        });
+        Ok(change_id)
+    }
+
+    pub fn stage_update(
+        &mut self,
+        id: SessionId,
+        table: TableName,
+        last_seen: Vec<(ColumnName, Cell)>,
+        new_values: Vec<(ColumnName, Cell)>,
+    ) -> Result<StagedChangeId, StageError> {
+        let session = self.session_mut(id)?;
+        let identity = session
+            .database
+            .row_identity(&table, &last_seen)
+            .map_err(|error| StageError::Database(error.to_string()))?
+            .ok_or(StageError::MissingRowIdentity)?;
+        let change_id = StagedChangeId::new(session.next_change_id);
+        session.next_change_id += 1;
+        session.staged.push(StagedChange::Update {
+            id: change_id,
+            table,
+            identity,
+            last_seen,
+            new_values,
+        });
+        Ok(change_id)
+    }
+
+    pub fn stage_delete(
+        &mut self,
+        id: SessionId,
+        table: TableName,
+        last_seen: Vec<(ColumnName, Cell)>,
+    ) -> Result<StagedChangeId, StageError> {
+        let session = self.session_mut(id)?;
+        let identity = session
+            .database
+            .row_identity(&table, &last_seen)
+            .map_err(|error| StageError::Database(error.to_string()))?
+            .ok_or(StageError::MissingRowIdentity)?;
+        let change_id = StagedChangeId::new(session.next_change_id);
+        session.next_change_id += 1;
+        session.staged.push(StagedChange::Delete {
+            id: change_id,
+            table,
+            identity,
+            last_seen,
+        });
+        Ok(change_id)
+    }
+
+    pub fn unstage(&mut self, id: SessionId, change: StagedChangeId) -> Result<(), StageError> {
+        let session = self.session_mut(id)?;
+        session.staged.retain(|staged| staged.id() != change);
+        Ok(())
+    }
+
+    pub fn discard_staged_changes(&mut self, id: SessionId) -> Result<(), StageError> {
+        self.session_mut(id)?.staged.clear();
+        Ok(())
+    }
+
+    pub fn staged_changes(&self, id: SessionId) -> Result<&[StagedChange], CatalogError> {
+        Ok(&self.session(id)?.staged)
+    }
+
+    pub fn apply(&mut self, id: SessionId) -> Result<(), ApplyError> {
+        let session = self
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == id)
+            .ok_or(ApplyError::UnknownSession)?;
+        session
+            .database
+            .apply_staged(&session.staged)
+            .map_err(|error| match error {
+                ApplyEngineError::Conflict => ApplyError::Conflict,
+                ApplyEngineError::Database(message) => ApplyError::Database(message),
+            })?;
+        session.staged.clear();
+        Ok(())
+    }
+
     fn session(&self, id: SessionId) -> Result<&Session, CatalogError> {
         self.sessions
             .iter()
             .find(|session| session.id == id)
             .ok_or(CatalogError::UnknownSession)
+    }
+
+    fn session_mut(&mut self, id: SessionId) -> Result<&mut Session, StageError> {
+        self.sessions
+            .iter_mut()
+            .find(|session| session.id == id)
+            .ok_or(StageError::UnknownSession)
     }
 }
 
@@ -187,8 +296,9 @@ impl Client {
 mod tests {
     use super::*;
     use crate::connection_string::ConnectionString;
+    use crate::staged::{ApplyError, StageError, StagedChange};
     use crate::table::TableName;
-    use crate::table_page::{Cell, Filter, Page};
+    use crate::table_page::{Cell, ColumnName, Filter, Page, TablePage};
 
     fn connection_at(path: &std::path::Path) -> Connection {
         Connection::from_string(ConnectionString::parse(path.to_str().unwrap()).unwrap())
@@ -578,5 +688,311 @@ mod tests {
             ]]
         );
         assert!(!page.has_next());
+    }
+
+    fn users() -> TableName {
+        TableName::new("users".into())
+    }
+
+    fn notes() -> TableName {
+        TableName::new("notes".into())
+    }
+
+    fn named_row(page: &TablePage, index: usize) -> Vec<(ColumnName, Cell)> {
+        page.columns()
+            .iter()
+            .cloned()
+            .zip(page.rows()[index].iter().cloned())
+            .collect()
+    }
+
+    fn open_seeded_client(dir: &tempfile::TempDir) -> (Client, SessionId, std::path::PathBuf) {
+        let db_path = dir.path().join("shop.db");
+        seed_users(&db_path);
+        let mut client = Client::open(dir.path().join("preferences.json")).unwrap();
+        let id = client.open_session(&connection_at(&db_path)).unwrap();
+        (client, id, db_path)
+    }
+
+    #[test]
+    fn stage_insert_update_delete_do_not_write_until_apply() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("shop.db");
+        let connection = rusqlite::Connection::open(&db_path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT);
+                 INSERT INTO users (name) VALUES ('ken');
+                 INSERT INTO users (name) VALUES ('ada');",
+            )
+            .unwrap();
+        drop(connection);
+        let mut client = Client::open(dir.path().join("preferences.json")).unwrap();
+        let id = client.open_session(&connection_at(&db_path)).unwrap();
+        let page = client.table_page(id, &users(), &[], Page::first()).unwrap();
+        client
+            .stage_update(
+                id,
+                users(),
+                named_row(&page, 0),
+                vec![(ColumnName::new("name".into()), Cell::Text("zoe".into()))],
+            )
+            .unwrap();
+        client
+            .stage_delete(id, users(), named_row(&page, 1))
+            .unwrap();
+        client
+            .stage_insert(
+                id,
+                users(),
+                vec![(ColumnName::new("name".into()), Cell::Text("bob".into()))],
+            )
+            .unwrap();
+        let staged = client.table_page(id, &users(), &[], Page::first()).unwrap();
+        assert_eq!(
+            staged.rows(),
+            [
+                [Cell::Integer(1), Cell::Text("ken".into())],
+                [Cell::Integer(2), Cell::Text("ada".into())]
+            ]
+        );
+        client.apply(id).unwrap();
+        let applied = client.table_page(id, &users(), &[], Page::first()).unwrap();
+        assert_eq!(
+            applied.rows(),
+            [
+                [Cell::Integer(1), Cell::Text("zoe".into())],
+                [Cell::Integer(3), Cell::Text("bob".into())]
+            ]
+        );
+        assert!(client.staged_changes(id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn update_and_delete_require_row_identity_insert_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("shop.db");
+        let connection = rusqlite::Connection::open(&db_path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT);
+                 INSERT INTO users (name) VALUES ('ken');
+                 CREATE TABLE notes (body TEXT, tag TEXT);
+                 INSERT INTO notes (body, tag) VALUES ('hello', 'a');",
+            )
+            .unwrap();
+        drop(connection);
+        let mut client = Client::open(dir.path().join("preferences.json")).unwrap();
+        let id = client.open_session(&connection_at(&db_path)).unwrap();
+        let notes_page = client.table_page(id, &notes(), &[], Page::first()).unwrap();
+        let insert_id = client
+            .stage_insert(
+                id,
+                notes(),
+                vec![(ColumnName::new("body".into()), Cell::Text("world".into()))],
+            )
+            .unwrap();
+        assert_eq!(client.staged_changes(id).unwrap()[0].id(), insert_id);
+        assert_eq!(
+            client.stage_update(
+                id,
+                notes(),
+                named_row(&notes_page, 0),
+                vec![(ColumnName::new("body".into()), Cell::Text("nope".into()))],
+            ),
+            Err(StageError::MissingRowIdentity)
+        );
+        assert_eq!(
+            client.stage_delete(id, notes(), named_row(&notes_page, 0)),
+            Err(StageError::MissingRowIdentity)
+        );
+        let users_page = client.table_page(id, &users(), &[], Page::first()).unwrap();
+        client
+            .stage_update(
+                id,
+                users(),
+                named_row(&users_page, 0),
+                vec![(ColumnName::new("name".into()), Cell::Text("zoe".into()))],
+            )
+            .unwrap();
+        client.apply(id).unwrap();
+        let notes_after = client.table_page(id, &notes(), &[], Page::first()).unwrap();
+        assert_eq!(
+            notes_after.rows(),
+            [
+                [Cell::Text("hello".into()), Cell::Text("a".into())],
+                [Cell::Text("world".into()), Cell::Null]
+            ]
+        );
+        let users_after = client.table_page(id, &users(), &[], Page::first()).unwrap();
+        assert_eq!(
+            users_after.rows(),
+            [[Cell::Integer(1), Cell::Text("zoe".into())]]
+        );
+    }
+
+    #[test]
+    fn unstage_one_leaves_the_rest_and_does_not_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut client, id, _) = open_seeded_client(&dir);
+        let page = client.table_page(id, &users(), &[], Page::first()).unwrap();
+        let update = client
+            .stage_update(
+                id,
+                users(),
+                named_row(&page, 0),
+                vec![(ColumnName::new("name".into()), Cell::Text("zoe".into()))],
+            )
+            .unwrap();
+        let insert = client
+            .stage_insert(
+                id,
+                users(),
+                vec![(ColumnName::new("name".into()), Cell::Text("bob".into()))],
+            )
+            .unwrap();
+        client.unstage(id, update).unwrap();
+        let remaining: Vec<_> = client
+            .staged_changes(id)
+            .unwrap()
+            .iter()
+            .map(StagedChange::id)
+            .collect();
+        assert_eq!(remaining, [insert]);
+        let still = client.table_page(id, &users(), &[], Page::first()).unwrap();
+        assert_eq!(still.rows(), [[Cell::Integer(1), Cell::Text("ken".into())]]);
+    }
+
+    #[test]
+    fn discard_clears_the_bag_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut client, id, _) = open_seeded_client(&dir);
+        let page = client.table_page(id, &users(), &[], Page::first()).unwrap();
+        client
+            .stage_update(
+                id,
+                users(),
+                named_row(&page, 0),
+                vec![(ColumnName::new("name".into()), Cell::Text("zoe".into()))],
+            )
+            .unwrap();
+        client
+            .stage_insert(
+                id,
+                users(),
+                vec![(ColumnName::new("name".into()), Cell::Text("bob".into()))],
+            )
+            .unwrap();
+        client.discard_staged_changes(id).unwrap();
+        assert!(client.staged_changes(id).unwrap().is_empty());
+        let still = client.table_page(id, &users(), &[], Page::first()).unwrap();
+        assert_eq!(still.rows(), [[Cell::Integer(1), Cell::Text("ken".into())]]);
+    }
+
+    #[test]
+    fn apply_is_one_transaction_and_rolls_back_on_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("shop.db");
+        let connection = rusqlite::Connection::open(&db_path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE);
+                 INSERT INTO users (name) VALUES ('ken');",
+            )
+            .unwrap();
+        drop(connection);
+        let mut client = Client::open(dir.path().join("preferences.json")).unwrap();
+        let id = client.open_session(&connection_at(&db_path)).unwrap();
+        client
+            .stage_insert(
+                id,
+                users(),
+                vec![(ColumnName::new("name".into()), Cell::Text("ada".into()))],
+            )
+            .unwrap();
+        client
+            .stage_insert(
+                id,
+                users(),
+                vec![(ColumnName::new("name".into()), Cell::Text("ken".into()))],
+            )
+            .unwrap();
+        assert!(client.apply(id).is_err());
+        let still = client.table_page(id, &users(), &[], Page::first()).unwrap();
+        assert_eq!(still.rows(), [[Cell::Integer(1), Cell::Text("ken".into())]]);
+        assert_eq!(client.staged_changes(id).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn apply_rolls_back_when_row_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut client, id, db_path) = open_seeded_client(&dir);
+        let page = client.table_page(id, &users(), &[], Page::first()).unwrap();
+        client
+            .stage_update(
+                id,
+                users(),
+                named_row(&page, 0),
+                vec![(ColumnName::new("name".into()), Cell::Text("zoe".into()))],
+            )
+            .unwrap();
+        let connection = rusqlite::Connection::open(&db_path).unwrap();
+        connection
+            .execute("UPDATE users SET name = 'other' WHERE id = 1", [])
+            .unwrap();
+        drop(connection);
+        assert_eq!(client.apply(id), Err(ApplyError::Conflict));
+        let still = client.table_page(id, &users(), &[], Page::first()).unwrap();
+        assert_eq!(
+            still.rows(),
+            [[Cell::Integer(1), Cell::Text("other".into())]]
+        );
+        assert_eq!(client.staged_changes(id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn two_sessions_on_the_same_connection_have_independent_bags() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("shop.db");
+        seed_users(&db_path);
+        let mut client = Client::open(dir.path().join("preferences.json")).unwrap();
+        let connection = connection_at(&db_path);
+        let a = client.open_session(&connection).unwrap();
+        let b = client.open_session(&connection).unwrap();
+        let page = client.table_page(a, &users(), &[], Page::first()).unwrap();
+        client
+            .stage_update(
+                a,
+                users(),
+                named_row(&page, 0),
+                vec![(ColumnName::new("name".into()), Cell::Text("zoe".into()))],
+            )
+            .unwrap();
+        client
+            .stage_insert(
+                b,
+                users(),
+                vec![(ColumnName::new("name".into()), Cell::Text("bob".into()))],
+            )
+            .unwrap();
+        assert_eq!(client.staged_changes(a).unwrap().len(), 1);
+        assert_eq!(client.staged_changes(b).unwrap().len(), 1);
+        client.apply(a).unwrap();
+        assert!(client.staged_changes(a).unwrap().is_empty());
+        assert_eq!(client.staged_changes(b).unwrap().len(), 1);
+        let after_a = client.table_page(b, &users(), &[], Page::first()).unwrap();
+        assert_eq!(
+            after_a.rows(),
+            [[Cell::Integer(1), Cell::Text("zoe".into())]]
+        );
+        client.apply(b).unwrap();
+        let after_b = client.table_page(a, &users(), &[], Page::first()).unwrap();
+        assert_eq!(
+            after_b.rows(),
+            [
+                [Cell::Integer(1), Cell::Text("zoe".into())],
+                [Cell::Integer(2), Cell::Text("bob".into())]
+            ]
+        );
     }
 }

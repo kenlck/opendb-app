@@ -1,7 +1,8 @@
 mod sqlite;
 
+use crate::staged::{RowIdentity, StagedChange};
 use crate::table::TableName;
-use crate::table_page::{Filter, Page, TablePage};
+use crate::table_page::{Cell, ColumnName, Filter, Page, TablePage};
 
 pub(crate) use sqlite::{SqliteDatabase, SqliteOpenError};
 
@@ -13,6 +14,12 @@ pub(crate) trait Database {
         filters: &[Filter],
         page: Page,
     ) -> Result<TablePage, DatabaseError>;
+    fn row_identity(
+        &self,
+        table: &TableName,
+        row: &[(ColumnName, Cell)],
+    ) -> Result<Option<RowIdentity>, DatabaseError>;
+    fn apply_staged(&self, changes: &[StagedChange]) -> Result<(), ApplyEngineError>;
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -26,5 +33,19 @@ impl DatabaseError {
         Self {
             message: error.to_string(),
         }
+    }
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub(crate) enum ApplyEngineError {
+    #[error("a row changed since it was read")]
+    Conflict,
+    #[error("{0}")]
+    Database(String),
+}
+
+impl From<DatabaseError> for ApplyEngineError {
+    fn from(error: DatabaseError) -> Self {
+        Self::Database(error.message)
     }
 }

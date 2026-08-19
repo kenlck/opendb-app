@@ -4,7 +4,8 @@ use rusqlite::types::{Value, ValueRef};
 use rusqlite::{Connection, OpenFlags, params_from_iter};
 use url::Url;
 
-use super::{Database, DatabaseError};
+use super::{ApplyEngineError, Database, DatabaseError};
+use crate::staged::{RowIdentity, StagedChange};
 use crate::table::TableName;
 use crate::table_page::{Cell, ColumnName, Filter, Page, TABLE_PAGE_SIZE, TablePage};
 
@@ -195,5 +196,206 @@ impl Database for SqliteDatabase {
             .collect::<Result<Vec<_>, _>>()
             .map_err(DatabaseError::from_engine)?;
         Ok(TablePage::from_fetched(columns, rows))
+    }
+
+    fn row_identity(
+        &self,
+        table: &TableName,
+        row: &[(ColumnName, Cell)],
+    ) -> Result<Option<RowIdentity>, DatabaseError> {
+        let Some(names) = identity_column_names(&self.connection, table)? else {
+            return Ok(None);
+        };
+        let mut columns = Vec::with_capacity(names.len());
+        for name in names {
+            let Some((_, cell)) = row.iter().find(|(column, _)| column.as_str() == name) else {
+                return Ok(None);
+            };
+            columns.push((ColumnName::new(name), cell.clone()));
+        }
+        Ok(Some(RowIdentity::new(columns)))
+    }
+
+    fn apply_staged(&self, changes: &[StagedChange]) -> Result<(), ApplyEngineError> {
+        let tx = self
+            .connection
+            .unchecked_transaction()
+            .map_err(DatabaseError::from_engine)?;
+        for change in changes {
+            apply_change(&tx, change)?;
+        }
+        tx.commit().map_err(DatabaseError::from_engine)?;
+        Ok(())
+    }
+}
+
+fn identity_column_names(
+    connection: &Connection,
+    table: &TableName,
+) -> Result<Option<Vec<String>>, DatabaseError> {
+    let pragma = format!("PRAGMA table_info({})", quote_ident(table.as_str()));
+    let mut statement = connection
+        .prepare(&pragma)
+        .map_err(DatabaseError::from_engine)?;
+    let mut pk_columns = statement
+        .query_map([], |row| {
+            let name = row.get::<_, String>(1)?;
+            let pk = row.get::<_, i64>(5)?;
+            Ok((pk, name))
+        })
+        .map_err(DatabaseError::from_engine)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(DatabaseError::from_engine)?;
+    pk_columns.retain(|(pk, _)| *pk > 0);
+    if !pk_columns.is_empty() {
+        pk_columns.sort_by_key(|(pk, _)| *pk);
+        return Ok(Some(pk_columns.into_iter().map(|(_, name)| name).collect()));
+    }
+
+    let list = format!("PRAGMA index_list({})", quote_ident(table.as_str()));
+    let mut statement = connection
+        .prepare(&list)
+        .map_err(DatabaseError::from_engine)?;
+    let mut indexes = statement
+        .query_map([], |row| {
+            let name = row.get::<_, String>(1)?;
+            let unique = row.get::<_, i64>(2)?;
+            let origin = row.get::<_, String>(3)?;
+            let partial = row.get::<_, i64>(4)?;
+            Ok((name, unique, origin, partial))
+        })
+        .map_err(DatabaseError::from_engine)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(DatabaseError::from_engine)?;
+    indexes.retain(|(_, unique, origin, partial)| *unique == 1 && *partial == 0 && origin != "pk");
+    indexes.sort_by(|a, b| a.0.cmp(&b.0));
+    for (index_name, _, _, _) in indexes {
+        let info = format!("PRAGMA index_info({})", quote_ident(&index_name));
+        let mut statement = connection
+            .prepare(&info)
+            .map_err(DatabaseError::from_engine)?;
+        let mut columns = statement
+            .query_map([], |row| {
+                let seqno = row.get::<_, i64>(0)?;
+                let name = row.get::<_, Option<String>>(2)?;
+                Ok((seqno, name))
+            })
+            .map_err(DatabaseError::from_engine)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(DatabaseError::from_engine)?;
+        if columns.iter().any(|(_, name)| name.is_none()) {
+            continue;
+        }
+        columns.sort_by_key(|(seqno, _)| *seqno);
+        return Ok(Some(
+            columns.into_iter().filter_map(|(_, name)| name).collect(),
+        ));
+    }
+    Ok(None)
+}
+
+fn apply_change(connection: &Connection, change: &StagedChange) -> Result<(), ApplyEngineError> {
+    match change {
+        StagedChange::Insert { table, values, .. } => {
+            let sql = insert_sql(table, values);
+            let params = values.iter().map(|(_, cell)| value_from_cell(cell));
+            connection
+                .execute(&sql, params_from_iter(params))
+                .map_err(DatabaseError::from_engine)?;
+            Ok(())
+        }
+        StagedChange::Update {
+            table,
+            identity,
+            last_seen,
+            new_values,
+            ..
+        } => {
+            let mut sql = format!("UPDATE {} SET ", quote_ident(table.as_str()));
+            let mut params = Vec::new();
+            for (index, (column, cell)) in new_values.iter().enumerate() {
+                if index > 0 {
+                    sql.push_str(", ");
+                }
+                sql.push_str(&quote_ident(column.as_str()));
+                sql.push_str(" = ?");
+                params.push(value_from_cell(cell));
+            }
+            push_row_predicate(&mut sql, &mut params, identity, last_seen);
+            let changed = connection
+                .execute(&sql, params_from_iter(params.iter()))
+                .map_err(DatabaseError::from_engine)?;
+            if changed != 1 {
+                return Err(ApplyEngineError::Conflict);
+            }
+            Ok(())
+        }
+        StagedChange::Delete {
+            table,
+            identity,
+            last_seen,
+            ..
+        } => {
+            let mut sql = format!("DELETE FROM {}", quote_ident(table.as_str()));
+            let mut params = Vec::new();
+            push_row_predicate(&mut sql, &mut params, identity, last_seen);
+            let changed = connection
+                .execute(&sql, params_from_iter(params.iter()))
+                .map_err(DatabaseError::from_engine)?;
+            if changed != 1 {
+                return Err(ApplyEngineError::Conflict);
+            }
+            Ok(())
+        }
+    }
+}
+
+fn insert_sql(table: &TableName, values: &[(ColumnName, Cell)]) -> String {
+    if values.is_empty() {
+        return format!("INSERT INTO {} DEFAULT VALUES", quote_ident(table.as_str()));
+    }
+    let columns = values
+        .iter()
+        .map(|(column, _)| quote_ident(column.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let placeholders = vec!["?"; values.len()].join(", ");
+    format!(
+        "INSERT INTO {} ({}) VALUES ({})",
+        quote_ident(table.as_str()),
+        columns,
+        placeholders
+    )
+}
+
+fn push_row_predicate(
+    sql: &mut String,
+    params: &mut Vec<Value>,
+    identity: &RowIdentity,
+    last_seen: &[(ColumnName, Cell)],
+) {
+    let mut seen = Vec::new();
+    sql.push_str(" WHERE ");
+    let mut first = true;
+    for (column, cell) in identity.columns().iter().chain(last_seen.iter()) {
+        if seen.iter().any(|name| name == column.as_str()) {
+            continue;
+        }
+        seen.push(column.as_str().to_string());
+        if !first {
+            sql.push_str(" AND ");
+        }
+        first = false;
+        match cell {
+            Cell::Null => {
+                sql.push_str(&quote_ident(column.as_str()));
+                sql.push_str(" IS NULL");
+            }
+            other => {
+                sql.push_str(&quote_ident(column.as_str()));
+                sql.push_str(" = ?");
+                params.push(value_from_cell(other));
+            }
+        }
     }
 }
