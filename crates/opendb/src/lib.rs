@@ -7,6 +7,7 @@ mod list;
 mod name;
 mod store;
 mod table;
+mod table_page;
 
 pub use catalog::SystemCatalogPreference;
 pub use client::{CatalogError, Client, CloseResult, OpenError, PreferenceError, SessionId};
@@ -16,3 +17,4 @@ pub use list::{AddResult, BundleError, ConnectionList};
 pub use name::Name;
 pub use store::{FileStore, StoreError};
 pub use table::{Table, TableCatalog, TableName};
+pub use table_page::{Cell, ColumnName, Filter, Page, TABLE_PAGE_SIZE, TablePage};

@@ -9,7 +9,8 @@ use crate::connection::Connection;
 use crate::connection_string::Engine;
 use crate::engine::{Database, SqliteDatabase, SqliteOpenError};
 use crate::name::Name;
-use crate::table::TableCatalog;
+use crate::table::{TableCatalog, TableName};
+use crate::table_page::{Filter, Page, TablePage};
 
 pub struct Client {
     preferences_path: PathBuf,
@@ -160,6 +161,20 @@ impl Client {
         ))
     }
 
+    pub fn table_page(
+        &self,
+        id: SessionId,
+        table: &TableName,
+        filters: &[Filter],
+        page: Page,
+    ) -> Result<TablePage, CatalogError> {
+        let session = self.session(id)?;
+        session
+            .database
+            .table_page(table, filters, page)
+            .map_err(|error| CatalogError::Database(error.to_string()))
+    }
+
     fn session(&self, id: SessionId) -> Result<&Session, CatalogError> {
         self.sessions
             .iter()
@@ -172,6 +187,8 @@ impl Client {
 mod tests {
     use super::*;
     use crate::connection_string::ConnectionString;
+    use crate::table::TableName;
+    use crate::table_page::{Cell, Filter, Page};
 
     fn connection_at(path: &std::path::Path) -> Connection {
         Connection::from_string(ConnectionString::parse(path.to_str().unwrap()).unwrap())
@@ -288,5 +305,278 @@ mod tests {
             client.open_session(&connection),
             Err(OpenError::MissingFile)
         );
+    }
+
+    #[test]
+    fn table_page_is_bounded_and_has_next() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("shop.db");
+        let connection = rusqlite::Connection::open(&db_path).unwrap();
+        connection
+            .execute(
+                "CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT)",
+                [],
+            )
+            .unwrap();
+        for index in 1..=101 {
+            connection
+                .execute(
+                    "INSERT INTO users (name) VALUES (?)",
+                    [format!("user-{index:03}")],
+                )
+                .unwrap();
+        }
+        drop(connection);
+        let mut client = Client::open(dir.path().join("preferences.json")).unwrap();
+        let id = client.open_session(&connection_at(&db_path)).unwrap();
+        let page = client
+            .table_page(id, &TableName::new("users".into()), &[], Page::first())
+            .unwrap();
+        assert_eq!(
+            page.columns()
+                .iter()
+                .map(|column| column.as_str())
+                .collect::<Vec<_>>(),
+            ["id", "name"]
+        );
+        assert_eq!(page.rows().len(), 100);
+        assert_eq!(
+            page.rows()[0],
+            [Cell::Integer(1), Cell::Text("user-001".into())]
+        );
+        assert_eq!(
+            page.rows()[99],
+            [Cell::Integer(100), Cell::Text("user-100".into())]
+        );
+        assert!(page.has_next());
+        let next = client
+            .table_page(
+                id,
+                &TableName::new("users".into()),
+                &[],
+                Page::first().next(),
+            )
+            .unwrap();
+        assert_eq!(next.rows().len(), 1);
+        assert_eq!(
+            next.rows()[0],
+            [Cell::Integer(101), Cell::Text("user-101".into())]
+        );
+        assert!(!next.has_next());
+    }
+
+    #[test]
+    fn next_page_uses_the_current_filters() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("shop.db");
+        let connection = rusqlite::Connection::open(&db_path).unwrap();
+        connection
+            .execute(
+                "CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, city TEXT)",
+                [],
+            )
+            .unwrap();
+        for index in 1..=101 {
+            connection
+                .execute(
+                    "INSERT INTO users (name, city) VALUES (?, 'keep')",
+                    [format!("keep-{index:03}")],
+                )
+                .unwrap();
+        }
+        for index in 1..=50 {
+            connection
+                .execute(
+                    "INSERT INTO users (name, city) VALUES (?, 'drop')",
+                    [format!("drop-{index:03}")],
+                )
+                .unwrap();
+        }
+        drop(connection);
+        let mut client = Client::open(dir.path().join("preferences.json")).unwrap();
+        let id = client.open_session(&connection_at(&db_path)).unwrap();
+        let filters = [Filter::equals("city", Cell::Text("keep".into()))];
+        let first = client
+            .table_page(id, &TableName::new("users".into()), &filters, Page::first())
+            .unwrap();
+        assert_eq!(first.rows().len(), 100);
+        assert_eq!(
+            first.rows()[0],
+            [
+                Cell::Integer(1),
+                Cell::Text("keep-001".into()),
+                Cell::Text("keep".into())
+            ]
+        );
+        assert_eq!(
+            first.rows()[99],
+            [
+                Cell::Integer(100),
+                Cell::Text("keep-100".into()),
+                Cell::Text("keep".into())
+            ]
+        );
+        assert!(first.has_next());
+        let second = client
+            .table_page(
+                id,
+                &TableName::new("users".into()),
+                &filters,
+                Page::first().next(),
+            )
+            .unwrap();
+        assert_eq!(second.rows().len(), 1);
+        assert_eq!(
+            second.rows()[0],
+            [
+                Cell::Integer(101),
+                Cell::Text("keep-101".into()),
+                Cell::Text("keep".into())
+            ]
+        );
+        assert!(!second.has_next());
+    }
+
+    #[test]
+    fn equals_contains_and_null_filters_combine() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("shop.db");
+        let connection = rusqlite::Connection::open(&db_path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, note TEXT, flag TEXT);
+                 INSERT INTO items (id, name, note, flag) VALUES
+                    (1, 'apple', 'pie', NULL),
+                    (2, 'apple', 'tart', 'x'),
+                    (3, 'banana', 'pie', NULL),
+                    (4, 'apple pie', 'pie', NULL);",
+            )
+            .unwrap();
+        drop(connection);
+        let mut client = Client::open(dir.path().join("preferences.json")).unwrap();
+        let id = client.open_session(&connection_at(&db_path)).unwrap();
+        let page = client
+            .table_page(
+                id,
+                &TableName::new("items".into()),
+                &[
+                    Filter::equals("name", Cell::Text("apple".into())),
+                    Filter::contains("note", "pi"),
+                    Filter::is_null("flag"),
+                ],
+                Page::first(),
+            )
+            .unwrap();
+        assert_eq!(
+            page.rows(),
+            [[
+                Cell::Integer(1),
+                Cell::Text("apple".into()),
+                Cell::Text("pie".into()),
+                Cell::Null
+            ]]
+        );
+        assert!(!page.has_next());
+    }
+
+    #[test]
+    fn table_without_row_identity_still_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("shop.db");
+        let connection = rusqlite::Connection::open(&db_path).unwrap();
+        connection
+            .execute("CREATE TABLE notes (body TEXT, tag TEXT)", [])
+            .unwrap();
+        for index in 1..=101 {
+            connection
+                .execute(
+                    "INSERT INTO notes (body, tag) VALUES (?, 'a')",
+                    [format!("note-{index:03}")],
+                )
+                .unwrap();
+        }
+        drop(connection);
+        let mut client = Client::open(dir.path().join("preferences.json")).unwrap();
+        let id = client.open_session(&connection_at(&db_path)).unwrap();
+        let page = client
+            .table_page(id, &TableName::new("notes".into()), &[], Page::first())
+            .unwrap();
+        assert_eq!(
+            page.columns()
+                .iter()
+                .map(|column| column.as_str())
+                .collect::<Vec<_>>(),
+            ["body", "tag"]
+        );
+        assert_eq!(page.rows().len(), 100);
+        assert_eq!(
+            page.rows()[0],
+            [Cell::Text("note-001".into()), Cell::Text("a".into())]
+        );
+        assert_eq!(
+            page.rows()[99],
+            [Cell::Text("note-100".into()), Cell::Text("a".into())]
+        );
+        assert!(page.has_next());
+    }
+
+    #[test]
+    fn filters_are_unlimited() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("shop.db");
+        let connection = rusqlite::Connection::open(&db_path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE wide (
+                    c00 TEXT, c01 TEXT, c02 TEXT, c03 TEXT,
+                    c04 TEXT, c05 TEXT, c06 TEXT, c07 TEXT,
+                    c08 TEXT, c09 TEXT, c10 TEXT, c11 TEXT
+                 );
+                 INSERT INTO wide VALUES (
+                    'a','b','c','d','e','f','g','h','i','j','k','l'
+                 );
+                 INSERT INTO wide VALUES (
+                    'a','b','c','d','e','f','g','h','i','j','k','NO'
+                 );",
+            )
+            .unwrap();
+        drop(connection);
+        let mut client = Client::open(dir.path().join("preferences.json")).unwrap();
+        let id = client.open_session(&connection_at(&db_path)).unwrap();
+        let filters = [
+            Filter::equals("c00", Cell::Text("a".into())),
+            Filter::equals("c01", Cell::Text("b".into())),
+            Filter::equals("c02", Cell::Text("c".into())),
+            Filter::equals("c03", Cell::Text("d".into())),
+            Filter::equals("c04", Cell::Text("e".into())),
+            Filter::equals("c05", Cell::Text("f".into())),
+            Filter::equals("c06", Cell::Text("g".into())),
+            Filter::equals("c07", Cell::Text("h".into())),
+            Filter::equals("c08", Cell::Text("i".into())),
+            Filter::equals("c09", Cell::Text("j".into())),
+            Filter::equals("c10", Cell::Text("k".into())),
+            Filter::equals("c11", Cell::Text("l".into())),
+        ];
+        let page = client
+            .table_page(id, &TableName::new("wide".into()), &filters, Page::first())
+            .unwrap();
+        assert_eq!(
+            page.rows(),
+            [[
+                Cell::Text("a".into()),
+                Cell::Text("b".into()),
+                Cell::Text("c".into()),
+                Cell::Text("d".into()),
+                Cell::Text("e".into()),
+                Cell::Text("f".into()),
+                Cell::Text("g".into()),
+                Cell::Text("h".into()),
+                Cell::Text("i".into()),
+                Cell::Text("j".into()),
+                Cell::Text("k".into()),
+                Cell::Text("l".into()),
+            ]]
+        );
+        assert!(!page.has_next());
     }
 }
