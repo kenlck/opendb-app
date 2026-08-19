@@ -1,11 +1,18 @@
+mod catalog;
+mod client;
 mod connection;
 mod connection_string;
+mod engine;
 mod list;
 mod name;
 mod store;
+mod table;
 
+pub use catalog::SystemCatalogPreference;
+pub use client::{CatalogError, Client, CloseResult, OpenError, PreferenceError, SessionId};
 pub use connection::Connection;
 pub use connection_string::{ConnectionString, Engine, ParseError};
 pub use list::{AddResult, BundleError, ConnectionList};
 pub use name::Name;
 pub use store::{FileStore, StoreError};
+pub use table::{Table, TableCatalog, TableName};
