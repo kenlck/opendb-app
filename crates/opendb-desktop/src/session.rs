@@ -2,12 +2,12 @@ use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::dialog::{DialogClose, DialogFooter};
-use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::input::{Editor, EditorState, Input, InputEvent, InputState};
 use gpui_component::table::{Column, DataTable, TableDelegate, TableState};
 use gpui_component::{ActiveTheme, Disableable, WindowExt, h_flex, v_flex};
 use opendb::{
-    Cell, Client, ColumnName, Filter, Page, SessionId, StagedChange, StagedChangeId,
-    SystemCatalogPreference, TableName, TablePage,
+    Cell, Client, ColumnName, Filter, Page, ResultStaging, SessionId, SqlKind, StagedChange,
+    StagedChangeId, SystemCatalogPreference, TableName, TablePage,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -15,6 +15,12 @@ enum DraftKind {
     Equals,
     Contains,
     IsNull,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum GridSource {
+    Table,
+    Query { sql: String, staging: ResultStaging },
 }
 
 struct PageGrid {
@@ -25,10 +31,11 @@ struct PageGrid {
     editing: Option<(usize, usize)>,
     insert_draft: Option<Vec<Cell>>,
     edit_input: Entity<InputState>,
+    editable: bool,
 }
 
 impl PageGrid {
-    fn from_page(page: &TablePage, edit_input: Entity<InputState>) -> Self {
+    fn from_page(page: &TablePage, edit_input: Entity<InputState>, editable: bool) -> Self {
         Self {
             columns: page
                 .columns()
@@ -44,6 +51,7 @@ impl PageGrid {
             editing: None,
             insert_draft: None,
             edit_input,
+            editable,
         }
     }
 
@@ -92,7 +100,7 @@ impl PageGrid {
         else {
             return;
         };
-        if matches!(cell, Cell::Blob(_)) {
+        if matches!(cell, Cell::Blob(_)) || !self.editable {
             self.selected_row = Some(row_ix);
             return;
         }
@@ -184,6 +192,8 @@ pub struct SessionView {
     column_input: Entity<InputState>,
     value_input: Entity<InputState>,
     edit_input: Entity<InputState>,
+    query_editor: Entity<EditorState>,
+    grid_source: GridSource,
     draft_kind: DraftKind,
     status: SharedString,
 }
@@ -205,6 +215,7 @@ impl SessionView {
         let column_input = cx.new(|cx| InputState::new(window, cx).placeholder("Column"));
         let value_input = cx.new(|cx| InputState::new(window, cx).placeholder("Value"));
         let edit_input = cx.new(|cx| InputState::new(window, cx));
+        let query_editor = cx.new(|cx| EditorState::new(window, cx).placeholder("SQL"));
         cx.subscribe(&edit_input, |this, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
                 this.commit_cell(cx);
@@ -228,6 +239,8 @@ impl SessionView {
             column_input,
             value_input,
             edit_input,
+            query_editor,
+            grid_source: GridSource::Table,
             draft_kind: DraftKind::Equals,
             status: SharedString::default(),
         }
@@ -306,6 +319,7 @@ impl SessionView {
         self.selected = Some(table);
         self.filters.clear();
         self.page = Page::first();
+        self.grid_source = GridSource::Table;
         self.reload(window, cx);
     }
 
@@ -333,6 +347,7 @@ impl SessionView {
         };
         self.filters.push(filter);
         self.page = Page::first();
+        self.grid_source = GridSource::Table;
         self.reload(window, cx);
     }
 
@@ -340,6 +355,7 @@ impl SessionView {
         if index < self.filters.len() {
             self.filters.remove(index);
             self.page = Page::first();
+            self.grid_source = GridSource::Table;
             self.reload(window, cx);
         }
     }
@@ -352,11 +368,92 @@ impl SessionView {
         self.reload(window, cx);
     }
 
+    fn active_table(&self) -> Option<TableName> {
+        match &self.grid_source {
+            GridSource::Table => self.selected.clone(),
+            GridSource::Query {
+                staging: ResultStaging::Staged { table },
+                ..
+            } => Some(table.clone()),
+            GridSource::Query { .. } => None,
+        }
+    }
+
+    fn run_sql(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let sql = self.query_editor.read(cx).value().to_string();
+        if sql.trim().is_empty() {
+            self.status = "SQL is required.".into();
+            cx.notify();
+            return;
+        }
+        let kind = self.client.read(cx).sql_kind(self.session_id, &sql);
+        match kind {
+            Ok(SqlKind::Read) => self.run_query(sql, window, cx),
+            Ok(SqlKind::Mutating) => self.confirm_mutating(sql, window, cx),
+            Err(err) => {
+                self.status = format!("{err}").into();
+                cx.notify();
+            }
+        }
+    }
+
+    fn run_query(&mut self, sql: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.grid_source = GridSource::Query {
+            sql,
+            staging: ResultStaging::ReadOnly,
+        };
+        self.page = Page::first();
+        self.reload(window, cx);
+    }
+
+    fn confirm_mutating(&mut self, sql: String, window: &mut Window, cx: &mut Context<Self>) {
+        let session = cx.entity().downgrade();
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog
+                .title("Run SQL")
+                .child("This SQL will change the Database.")
+                .footer(
+                    DialogFooter::new()
+                        .child(Button::new("run").primary().label("Run").on_click({
+                            let session = session.clone();
+                            let sql = sql.clone();
+                            move |_, window, cx| {
+                                session
+                                    .update(cx, |this, cx| {
+                                        this.execute_mutating(&sql, window, cx);
+                                        window.close_dialog(cx);
+                                    })
+                                    .ok();
+                            }
+                        }))
+                        .child(DialogClose::new().child(Button::new("cancel").label("Cancel"))),
+                )
+        });
+    }
+
+    fn execute_mutating(&mut self, sql: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let result = self.client.update(cx, |client, cx| {
+            let result = client.execute_mutating(self.session_id, sql);
+            cx.notify();
+            result
+        });
+        match result {
+            Ok(()) => {
+                self.status = SharedString::default();
+                self.reload(window, cx);
+            }
+            Err(err) => {
+                self.status = format!("{err}").into();
+                cx.notify();
+            }
+        }
+    }
+
     fn commit_cell(&mut self, cx: &mut Context<Self>) {
         let Some(grid) = self.grid.clone() else {
             return;
         };
-        let Some(table) = self.selected.clone() else {
+        let Some(table) = self.active_table() else {
             return;
         };
         let Some((row_ix, col_ix)) = grid.read(cx).delegate().editing else {
@@ -419,8 +516,11 @@ impl SessionView {
     }
 
     fn stage_insert_row(&mut self, cx: &mut Context<Self>) {
-        let Some(table) = self.selected.clone() else {
-            self.status = "Pick a Table first.".into();
+        let Some(table) = self.active_table() else {
+            self.status = match self.grid_source {
+                GridSource::Query { .. } => "This Result is read-only.".into(),
+                GridSource::Table => "Pick a Table first.".into(),
+            };
             cx.notify();
             return;
         };
@@ -450,6 +550,14 @@ impl SessionView {
     }
 
     fn start_insert_row(&mut self, cx: &mut Context<Self>) {
+        if self.active_table().is_none() {
+            self.status = match self.grid_source {
+                GridSource::Query { .. } => "This Result is read-only.".into(),
+                GridSource::Table => "Pick a Table first.".into(),
+            };
+            cx.notify();
+            return;
+        }
         let Some(grid) = &self.grid else {
             self.status = "Pick a Table first.".into();
             cx.notify();
@@ -463,8 +571,11 @@ impl SessionView {
     }
 
     fn stage_delete_row(&mut self, cx: &mut Context<Self>) {
-        let Some(table) = self.selected.clone() else {
-            self.status = "Pick a Table first.".into();
+        let Some(table) = self.active_table() else {
+            self.status = match self.grid_source {
+                GridSource::Query { .. } => "This Result is read-only.".into(),
+                GridSource::Table => "Pick a Table first.".into(),
+            };
             cx.notify();
             return;
         };
@@ -545,38 +656,61 @@ impl SessionView {
     }
 
     fn reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(table) = self.selected.clone() else {
-            return;
-        };
-        match self
-            .client
-            .read(cx)
-            .table_page(self.session_id, &table, &self.filters, self.page)
-        {
-            Ok(page) => {
-                self.has_next = page.has_next();
-                let delegate = PageGrid::from_page(&page, self.edit_input.clone());
-                match &self.grid {
-                    Some(state) => {
-                        state.update(cx, |state, cx| {
-                            *state.delegate_mut() = delegate;
-                            state.refresh(cx);
-                            cx.notify();
-                        });
-                    }
-                    None => {
-                        self.grid = Some(
-                            cx.new(|cx| TableState::new(delegate, window, cx).sortable(false)),
-                        );
-                    }
+        match self.grid_source.clone() {
+            GridSource::Table => {
+                let Some(table) = self.selected.clone() else {
+                    return;
+                };
+                match self.client.read(cx).table_page(
+                    self.session_id,
+                    &table,
+                    &self.filters,
+                    self.page,
+                ) {
+                    Ok(page) => self.show_page(&page, true, window, cx),
+                    Err(err) => self.status = format!("{err}").into(),
                 }
-                self.status = SharedString::default();
             }
-            Err(err) => {
-                self.status = format!("{err}").into();
+            GridSource::Query { sql, .. } => {
+                match self.client.read(cx).query(self.session_id, &sql, self.page) {
+                    Ok(result) => {
+                        let editable = matches!(result.staging(), ResultStaging::Staged { .. });
+                        self.grid_source = GridSource::Query {
+                            sql,
+                            staging: result.staging().clone(),
+                        };
+                        self.show_page(result.page(), editable, window, cx);
+                    }
+                    Err(err) => self.status = format!("{err}").into(),
+                }
             }
         }
         cx.notify();
+    }
+
+    fn show_page(
+        &mut self,
+        page: &TablePage,
+        editable: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.has_next = page.has_next();
+        let delegate = PageGrid::from_page(page, self.edit_input.clone(), editable);
+        match &self.grid {
+            Some(state) => {
+                state.update(cx, |state, cx| {
+                    *state.delegate_mut() = delegate;
+                    state.refresh(cx);
+                    cx.notify();
+                });
+            }
+            None => {
+                self.grid =
+                    Some(cx.new(|cx| TableState::new(delegate, window, cx).sortable(false)));
+            }
+        }
+        self.status = SharedString::default();
     }
 }
 
@@ -660,6 +794,7 @@ impl Render for SessionView {
             );
         }
 
+        let can_stage = self.active_table().is_some();
         let grid = match &self.grid {
             Some(state) => v_flex()
                 .flex_1()
@@ -688,6 +823,12 @@ impl Render for SessionView {
                     v_flex()
                         .flex_1()
                         .gap_2()
+                        .child(Editor::new(&self.query_editor).h(px(120.)))
+                        .child(
+                            Button::new("run-sql").primary().label("Run").on_click(
+                                cx.listener(|this, _, window, cx| this.run_sql(window, cx)),
+                            ),
+                        )
                         .child(
                             h_flex()
                                 .gap_2()
@@ -745,21 +886,30 @@ impl Render for SessionView {
                                             this.next_page(window, cx);
                                         })),
                                 )
-                                .child(Button::new("insert-row").label("Insert row").on_click(
-                                    cx.listener(|this, _, _, cx| {
-                                        this.start_insert_row(cx);
-                                    }),
-                                ))
-                                .child(Button::new("stage-insert").label("Stage insert").on_click(
-                                    cx.listener(|this, _, _, cx| {
-                                        this.stage_insert_row(cx);
-                                    }),
-                                ))
-                                .child(Button::new("stage-delete").label("Stage delete").on_click(
-                                    cx.listener(|this, _, _, cx| {
-                                        this.stage_delete_row(cx);
-                                    }),
-                                ))
+                                .child(
+                                    Button::new("insert-row")
+                                        .label("Insert row")
+                                        .disabled(!can_stage)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.start_insert_row(cx);
+                                        })),
+                                )
+                                .child(
+                                    Button::new("stage-insert")
+                                        .label("Stage insert")
+                                        .disabled(!can_stage)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.stage_insert_row(cx);
+                                        })),
+                                )
+                                .child(
+                                    Button::new("stage-delete")
+                                        .label("Stage delete")
+                                        .disabled(!can_stage)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.stage_delete_row(cx);
+                                        })),
+                                )
                                 .child(Button::new("apply").primary().label("Apply").on_click(
                                     cx.listener(|this, _, window, cx| {
                                         this.apply_changes(window, cx);

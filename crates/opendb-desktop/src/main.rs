@@ -223,7 +223,7 @@ fn preferences_path() -> std::path::PathBuf {
 
 fn session_window_options(name: &str, cx: &App) -> WindowOptions {
     WindowOptions {
-        window_bounds: Some(WindowBounds::centered(size(px(960.), px(640.)), cx)),
+        window_bounds: Some(WindowBounds::centered(size(px(960.), px(720.)), cx)),
         titlebar: Some(TitlebarOptions {
             title: Some(name.into()),
             ..Default::default()
