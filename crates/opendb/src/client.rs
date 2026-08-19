@@ -9,6 +9,7 @@ use crate::connection::Connection;
 use crate::connection_string::Engine;
 use crate::engine::{ApplyEngineError, Database, SqliteDatabase, SqliteOpenError};
 use crate::name::Name;
+use crate::query::{ExecuteError, QueryResult, SqlKind};
 use crate::staged::{ApplyError, StageError, StagedChange, StagedChangeId};
 use crate::table::{TableCatalog, TableName};
 use crate::table_page::{Cell, ColumnName, Filter, Page, TablePage};
@@ -180,6 +181,48 @@ impl Client {
             .map_err(|error| CatalogError::Database(error.to_string()))
     }
 
+    pub fn sql_kind(&self, id: SessionId, sql: &str) -> Result<SqlKind, ExecuteError> {
+        let session = self.session(id).map_err(|_| ExecuteError::UnknownSession)?;
+        session
+            .database
+            .sql_kind(sql)
+            .map_err(|error| ExecuteError::Database(error.to_string()))
+    }
+
+    pub fn query(&self, id: SessionId, sql: &str, page: Page) -> Result<QueryResult, ExecuteError> {
+        let session = self.session(id).map_err(|_| ExecuteError::UnknownSession)?;
+        match session
+            .database
+            .sql_kind(sql)
+            .map_err(|error| ExecuteError::Database(error.to_string()))?
+        {
+            SqlKind::Read => session
+                .database
+                .query(sql, page)
+                .map_err(|error| ExecuteError::Database(error.to_string())),
+            SqlKind::Mutating => Err(ExecuteError::MutatingSql),
+        }
+    }
+
+    pub fn execute_mutating(&self, id: SessionId, sql: &str) -> Result<(), ExecuteError> {
+        let session = self.session(id).map_err(|_| ExecuteError::UnknownSession)?;
+        match session
+            .database
+            .sql_kind(sql)
+            .map_err(|error| ExecuteError::Database(error.to_string()))?
+        {
+            SqlKind::Read => return Err(ExecuteError::ReadSql),
+            SqlKind::Mutating => {}
+        }
+        if !session.staged.is_empty() {
+            return Err(ExecuteError::StagedChangesExist);
+        }
+        session
+            .database
+            .execute_sql(sql)
+            .map_err(|error| ExecuteError::Database(error.to_string()))
+    }
+
     pub fn stage_insert(
         &mut self,
         id: SessionId,
@@ -296,6 +339,7 @@ impl Client {
 mod tests {
     use super::*;
     use crate::connection_string::ConnectionString;
+    use crate::query::{ExecuteError, ResultStaging, SqlKind};
     use crate::staged::{ApplyError, StageError, StagedChange};
     use crate::table::TableName;
     use crate::table_page::{Cell, ColumnName, Filter, Page, TablePage};
@@ -994,5 +1038,235 @@ mod tests {
                 [Cell::Integer(2), Cell::Text("bob".into())]
             ]
         );
+    }
+
+    #[test]
+    fn read_query_runs_immediately_and_is_paged() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("shop.db");
+        let connection = rusqlite::Connection::open(&db_path).unwrap();
+        connection
+            .execute(
+                "CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT)",
+                [],
+            )
+            .unwrap();
+        for index in 1..=101 {
+            connection
+                .execute(
+                    "INSERT INTO users (name) VALUES (?)",
+                    [format!("user-{index:03}")],
+                )
+                .unwrap();
+        }
+        drop(connection);
+        let mut client = Client::open(dir.path().join("preferences.json")).unwrap();
+        let id = client.open_session(&connection_at(&db_path)).unwrap();
+        assert_eq!(
+            client.sql_kind(id, "SELECT id, name FROM users ORDER BY id"),
+            Ok(SqlKind::Read)
+        );
+        let catalog = client.tables(id).unwrap();
+        let names: Vec<_> = catalog
+            .tables()
+            .iter()
+            .map(|table| table.name().as_str())
+            .collect();
+        assert_eq!(names, ["users"]);
+        let page = client
+            .query(id, "SELECT id, name FROM users ORDER BY id", Page::first())
+            .unwrap();
+        assert_eq!(
+            page.columns()
+                .iter()
+                .map(|column| column.as_str())
+                .collect::<Vec<_>>(),
+            ["id", "name"]
+        );
+        assert_eq!(page.rows().len(), 100);
+        assert_eq!(
+            page.rows()[0],
+            [Cell::Integer(1), Cell::Text("user-001".into())]
+        );
+        assert_eq!(
+            page.rows()[99],
+            [Cell::Integer(100), Cell::Text("user-100".into())]
+        );
+        assert!(page.has_next());
+        let next = client
+            .query(
+                id,
+                "SELECT id, name FROM users ORDER BY id",
+                Page::first().next(),
+            )
+            .unwrap();
+        assert_eq!(next.rows().len(), 1);
+        assert_eq!(
+            next.rows()[0],
+            [Cell::Integer(101), Cell::Text("user-101".into())]
+        );
+        assert!(!next.has_next());
+        let catalogs = client
+            .query(
+                id,
+                "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name",
+                Page::first(),
+            )
+            .unwrap();
+        assert_eq!(
+            catalogs.rows(),
+            [
+                [Cell::Text("sqlite_sequence".into())],
+                [Cell::Text("users".into())]
+            ]
+        );
+        assert_eq!(catalogs.staging(), &ResultStaging::ReadOnly);
+    }
+
+    #[test]
+    fn join_and_aggregate_results_are_read_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("shop.db");
+        let connection = rusqlite::Connection::open(&db_path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT);
+                 CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, total INTEGER);
+                 INSERT INTO users (name) VALUES ('ken');
+                 INSERT INTO orders (id, user_id, total) VALUES (1, 1, 9);",
+            )
+            .unwrap();
+        drop(connection);
+        let mut client = Client::open(dir.path().join("preferences.json")).unwrap();
+        let id = client.open_session(&connection_at(&db_path)).unwrap();
+        let joined = client
+            .query(
+                id,
+                "SELECT users.id, orders.total FROM users JOIN orders ON users.id = orders.user_id",
+                Page::first(),
+            )
+            .unwrap();
+        assert_eq!(joined.rows(), [[Cell::Integer(1), Cell::Integer(9)]]);
+        assert_eq!(joined.staging(), &ResultStaging::ReadOnly);
+        let aggregated = client
+            .query(id, "SELECT COUNT(*) FROM users", Page::first())
+            .unwrap();
+        assert_eq!(aggregated.rows(), [[Cell::Integer(1)]]);
+        assert_eq!(aggregated.staging(), &ResultStaging::ReadOnly);
+        let missing_identity = client
+            .query(id, "SELECT name FROM users", Page::first())
+            .unwrap();
+        assert_eq!(missing_identity.rows(), [[Cell::Text("ken".into())]]);
+        assert_eq!(missing_identity.staging(), &ResultStaging::ReadOnly);
+    }
+
+    #[test]
+    fn one_table_result_with_row_identity_can_stage() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut client, id, _) = open_seeded_client(&dir);
+        let result = client
+            .query(id, "SELECT id, name FROM users ORDER BY id", Page::first())
+            .unwrap();
+        assert_eq!(result.staging(), &ResultStaging::Staged { table: users() });
+        assert_eq!(
+            result.rows(),
+            [[Cell::Integer(1), Cell::Text("ken".into())]]
+        );
+        let ResultStaging::Staged { table } = result.staging().clone() else {
+            panic!("expected staged Result");
+        };
+        client
+            .stage_update(
+                id,
+                table,
+                named_row_from(result.columns(), &result.rows()[0]),
+                vec![(ColumnName::new("name".into()), Cell::Text("zoe".into()))],
+            )
+            .unwrap();
+        client.apply(id).unwrap();
+        let after = client
+            .query(id, "SELECT id, name FROM users ORDER BY id", Page::first())
+            .unwrap();
+        assert_eq!(after.rows(), [[Cell::Integer(1), Cell::Text("zoe".into())]]);
+        assert!(client.staged_changes(id).unwrap().is_empty());
+    }
+
+    fn named_row_from(columns: &[ColumnName], row: &[Cell]) -> Vec<(ColumnName, Cell)> {
+        columns.iter().cloned().zip(row.iter().cloned()).collect()
+    }
+
+    #[test]
+    fn mutating_sql_is_refused_while_staged_changes_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut client, id, _) = open_seeded_client(&dir);
+        client
+            .stage_insert(
+                id,
+                users(),
+                vec![(ColumnName::new("name".into()), Cell::Text("bob".into()))],
+            )
+            .unwrap();
+        assert_eq!(
+            client.sql_kind(id, "INSERT INTO users (name) VALUES ('ada')"),
+            Ok(SqlKind::Mutating)
+        );
+        assert_eq!(
+            client.execute_mutating(id, "INSERT INTO users (name) VALUES ('ada')"),
+            Err(ExecuteError::StagedChangesExist)
+        );
+        let still = client
+            .query(id, "SELECT id, name FROM users ORDER BY id", Page::first())
+            .unwrap();
+        assert_eq!(still.rows(), [[Cell::Integer(1), Cell::Text("ken".into())]]);
+        assert_eq!(client.staged_changes(id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn mutating_sql_runs_as_its_own_transaction_when_bag_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("shop.db");
+        let connection = rusqlite::Connection::open(&db_path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE);
+                 INSERT INTO users (name) VALUES ('ken');",
+            )
+            .unwrap();
+        drop(connection);
+        let mut client = Client::open(dir.path().join("preferences.json")).unwrap();
+        let id = client.open_session(&connection_at(&db_path)).unwrap();
+        client
+            .execute_mutating(id, "INSERT INTO users (name) VALUES ('ada')")
+            .unwrap();
+        assert!(client.staged_changes(id).unwrap().is_empty());
+        let after_insert = client
+            .query(id, "SELECT id, name FROM users ORDER BY id", Page::first())
+            .unwrap();
+        assert_eq!(
+            after_insert.rows(),
+            [
+                [Cell::Integer(1), Cell::Text("ken".into())],
+                [Cell::Integer(2), Cell::Text("ada".into())]
+            ]
+        );
+        assert!(
+            client
+                .execute_mutating(
+                    id,
+                    "INSERT INTO users (name) VALUES ('bob');\nINSERT INTO users (name) VALUES ('ken');"
+                )
+                .is_err()
+        );
+        let rolled_back = client
+            .query(id, "SELECT id, name FROM users ORDER BY id", Page::first())
+            .unwrap();
+        assert_eq!(
+            rolled_back.rows(),
+            [
+                [Cell::Integer(1), Cell::Text("ken".into())],
+                [Cell::Integer(2), Cell::Text("ada".into())]
+            ]
+        );
+        assert!(client.staged_changes(id).unwrap().is_empty());
     }
 }

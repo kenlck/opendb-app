@@ -5,6 +5,7 @@ use rusqlite::{Connection, OpenFlags, params_from_iter};
 use url::Url;
 
 use super::{ApplyEngineError, Database, DatabaseError};
+use crate::query::{QueryResult, ResultStaging, SqlKind, identity_present, one_table_projection};
 use crate::staged::{RowIdentity, StagedChange};
 use crate::table::TableName;
 use crate::table_page::{Cell, ColumnName, Filter, Page, TABLE_PAGE_SIZE, TablePage};
@@ -227,6 +228,100 @@ impl Database for SqliteDatabase {
         tx.commit().map_err(DatabaseError::from_engine)?;
         Ok(())
     }
+
+    fn sql_kind(&self, sql: &str) -> Result<SqlKind, DatabaseError> {
+        let statement = self
+            .connection
+            .prepare(sql)
+            .map_err(DatabaseError::from_engine)?;
+        if statement.readonly() {
+            Ok(SqlKind::Read)
+        } else {
+            Ok(SqlKind::Mutating)
+        }
+    }
+
+    fn query(&self, sql: &str, page: Page) -> Result<QueryResult, DatabaseError> {
+        if self.sql_kind(sql)? != SqlKind::Read {
+            return Err(DatabaseError::from_engine("SQL is mutating"));
+        }
+        let staging = result_staging(&self.connection, sql)?;
+        let page = query_page(&self.connection, sql, page)?;
+        Ok(QueryResult::new(page, staging))
+    }
+
+    fn execute_sql(&self, sql: &str) -> Result<(), DatabaseError> {
+        let tx = self
+            .connection
+            .unchecked_transaction()
+            .map_err(DatabaseError::from_engine)?;
+        tx.execute_batch(sql).map_err(DatabaseError::from_engine)?;
+        tx.commit().map_err(DatabaseError::from_engine)?;
+        Ok(())
+    }
+}
+
+fn trim_sql(sql: &str) -> &str {
+    sql.trim().trim_end_matches(';').trim()
+}
+
+fn result_staging(connection: &Connection, sql: &str) -> Result<ResultStaging, DatabaseError> {
+    let Some((table, projection)) = one_table_projection(sql) else {
+        return Ok(ResultStaging::ReadOnly);
+    };
+    let table = TableName::new(table);
+    let Some(identity) = identity_column_names(connection, &table)? else {
+        return Ok(ResultStaging::ReadOnly);
+    };
+    if identity_present(&identity, &projection) {
+        Ok(ResultStaging::Staged { table })
+    } else {
+        Ok(ResultStaging::ReadOnly)
+    }
+}
+
+fn query_page(connection: &Connection, sql: &str, page: Page) -> Result<TablePage, DatabaseError> {
+    let inner = trim_sql(sql);
+    let wrapped = format!("SELECT * FROM ({inner}) LIMIT ? OFFSET ?");
+    let mut params = vec![
+        Value::Integer((TABLE_PAGE_SIZE + 1) as i64),
+        Value::Integer((page.index() * TABLE_PAGE_SIZE) as i64),
+    ];
+    match fetch_rows(connection, &wrapped, &params) {
+        Ok(page) => Ok(page),
+        Err(_) => {
+            params.clear();
+            fetch_rows(connection, inner, &params)
+        }
+    }
+}
+
+fn fetch_rows(
+    connection: &Connection,
+    sql: &str,
+    params: &[Value],
+) -> Result<TablePage, DatabaseError> {
+    let mut statement = connection
+        .prepare(sql)
+        .map_err(DatabaseError::from_engine)?;
+    let columns = statement
+        .column_names()
+        .into_iter()
+        .map(|name| ColumnName::new(name.to_string()))
+        .collect::<Vec<_>>();
+    let column_count = columns.len();
+    let rows = statement
+        .query_map(params_from_iter(params.iter()), |row| {
+            let mut cells = Vec::with_capacity(column_count);
+            for index in 0..column_count {
+                cells.push(cell_from(row.get_ref(index)?));
+            }
+            Ok(cells)
+        })
+        .map_err(DatabaseError::from_engine)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(DatabaseError::from_engine)?;
+    Ok(TablePage::from_fetched(columns, rows))
 }
 
 fn identity_column_names(

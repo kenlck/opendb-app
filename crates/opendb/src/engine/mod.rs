@@ -1,5 +1,6 @@
 mod sqlite;
 
+use crate::query::{QueryResult, SqlKind};
 use crate::staged::{RowIdentity, StagedChange};
 use crate::table::TableName;
 use crate::table_page::{Cell, ColumnName, Filter, Page, TablePage};
@@ -20,6 +21,9 @@ pub(crate) trait Database {
         row: &[(ColumnName, Cell)],
     ) -> Result<Option<RowIdentity>, DatabaseError>;
     fn apply_staged(&self, changes: &[StagedChange]) -> Result<(), ApplyEngineError>;
+    fn sql_kind(&self, sql: &str) -> Result<SqlKind, DatabaseError>;
+    fn query(&self, sql: &str, page: Page) -> Result<QueryResult, DatabaseError>;
+    fn execute_sql(&self, sql: &str) -> Result<(), DatabaseError>;
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]

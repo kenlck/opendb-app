@@ -8,6 +8,7 @@ license.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sqlparser = "0.58"
 thiserror.workspace = true
 url.workspace = true
 
