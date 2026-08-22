@@ -34,6 +34,7 @@ pub struct SessionId(u64);
 struct Session {
     id: SessionId,
     name: Name,
+    engine: Engine,
     database: Box<dyn Database>,
     staged: Vec<StagedChange>,
     next_change_id: u64,
@@ -121,7 +122,8 @@ impl Client {
     }
 
     pub fn open_session(&mut self, connection: &Connection) -> Result<SessionId, OpenError> {
-        let database: Box<dyn Database> = match connection.connection_string().engine() {
+        let engine = connection.connection_string().engine();
+        let database: Box<dyn Database> = match engine {
             Engine::Sqlite => {
                 let opened = SqliteDatabase::open(connection.connection_string().as_str());
                 match opened {
@@ -158,6 +160,7 @@ impl Client {
         self.sessions.push(Session {
             id,
             name: connection.name().clone(),
+            engine,
             database,
             staged: Vec::new(),
             next_change_id: 1,
@@ -177,6 +180,10 @@ impl Client {
 
     pub fn session_name(&self, id: SessionId) -> Result<&Name, CatalogError> {
         Ok(&self.session(id)?.name)
+    }
+
+    pub fn session_engine(&self, id: SessionId) -> Result<Engine, CatalogError> {
+        Ok(self.session(id)?.engine)
     }
 
     pub fn tables(&self, id: SessionId) -> Result<TableCatalog, CatalogError> {
