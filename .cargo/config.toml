@@ -1,5 +1,4 @@
-# Cargo's built-in git client ignores insteadOf rewrites. Use the git CLI so
-# CI (and local setups) can map ssh://git@github.com/ → https:// without a
-# deploy key while keeping the Zed gpui [patch] pin.
+# Prefer the git CLI for Cargo fetches. Harmless locally; useful when a
+# [patch] git URL needs insteadOf or other git config.
 [net]
 git-fetch-with-cli = true
