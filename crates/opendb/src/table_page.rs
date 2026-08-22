@@ -15,6 +15,10 @@ impl ColumnName {
         Self(name)
     }
 
+    pub fn from_name(name: impl Into<String>) -> Self {
+        Self::new(name.into())
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }

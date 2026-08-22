@@ -6,6 +6,7 @@ mod engine;
 mod list;
 mod name;
 mod query;
+mod schema_change;
 mod staged;
 mod store;
 mod table;
@@ -19,6 +20,9 @@ pub use connection_string::{ConnectionString, Engine, ParseError};
 pub use list::{AddResult, BundleError, ConnectionList};
 pub use name::Name;
 pub use query::{ExecuteError, QueryResult, ResultStaging, SqlKind};
+pub use schema_change::{
+    ColumnDefinition, Namespace, SchemaChange, SchemaChangeError, schema_change_ddl,
+};
 pub use staged::{ApplyError, RowIdentity, StageError, StagedChange, StagedChangeId};
 pub use store::{FileStore, StoreError};
 pub use table::{Table, TableCatalog, TableName};
