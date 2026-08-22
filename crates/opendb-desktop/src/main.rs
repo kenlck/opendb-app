@@ -369,7 +369,7 @@ impl Render for ConnectionListView {
                             let view = view.clone();
                             move |menu, _, _| {
                                 menu.item(
-                                    PopupMenuItem::new("Copy Connection String").on_click({
+                                    PopupMenuItem::new("Copy Connection String (secret)").on_click({
                                         let view = view.clone();
                                         move |_, _, cx| {
                                             view.update(cx, |this, cx| {
