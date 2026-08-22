@@ -21,8 +21,12 @@ impl Table {
 }
 
 impl TableName {
-    pub(crate) fn new(name: String) -> Self {
+    pub fn new(name: String) -> Self {
         Self(name)
+    }
+
+    pub fn from_name(name: impl Into<String>) -> Self {
+        Self::new(name.into())
     }
 
     pub fn as_str(&self) -> &str {

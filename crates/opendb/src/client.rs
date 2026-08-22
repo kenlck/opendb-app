@@ -10,9 +10,11 @@ use crate::connection_string::Engine;
 use crate::engine::{ApplyEngineError, Database, SqliteDatabase, SqliteOpenError};
 use crate::name::Name;
 use crate::query::{ExecuteError, QueryResult, SqlKind};
+use crate::schema_change::{SchemaChange, SchemaChangeError, schema_change_ddl};
 use crate::staged::{ApplyError, StageError, StagedChange, StagedChangeId};
 use crate::table::{TableCatalog, TableName};
 use crate::table_page::{Cell, ColumnName, Filter, Page, TablePage};
+use crate::table_structure::TableStructure;
 
 pub struct Client {
     preferences_path: PathBuf,
@@ -181,6 +183,18 @@ impl Client {
             .map_err(|error| CatalogError::Database(error.to_string()))
     }
 
+    pub fn table_structure(
+        &self,
+        id: SessionId,
+        table: &TableName,
+    ) -> Result<TableStructure, CatalogError> {
+        let session = self.session(id)?;
+        session
+            .database
+            .table_structure(table)
+            .map_err(|error| CatalogError::Database(error.to_string()))
+    }
+
     pub fn sql_kind(&self, id: SessionId, sql: &str) -> Result<SqlKind, ExecuteError> {
         let session = self.session(id).map_err(|_| ExecuteError::UnknownSession)?;
         session
@@ -221,6 +235,28 @@ impl Client {
             .database
             .execute_sql(sql)
             .map_err(|error| ExecuteError::Database(error.to_string()))
+    }
+
+    pub fn schema_change_ddl(&self, change: &SchemaChange) -> String {
+        schema_change_ddl(change)
+    }
+
+    pub fn execute_schema_change(
+        &self,
+        id: SessionId,
+        change: &SchemaChange,
+    ) -> Result<(), SchemaChangeError> {
+        let session = self
+            .session(id)
+            .map_err(|_| SchemaChangeError::UnknownSession)?;
+        if !session.staged.is_empty() {
+            return Err(SchemaChangeError::StagedChangesExist);
+        }
+        let ddl = schema_change_ddl(change);
+        session
+            .database
+            .execute_sql(&ddl)
+            .map_err(|error| SchemaChangeError::Database(error.to_string()))
     }
 
     pub fn stage_insert(
@@ -340,6 +376,7 @@ mod tests {
     use super::*;
     use crate::connection_string::ConnectionString;
     use crate::query::{ExecuteError, ResultStaging, SqlKind};
+    use crate::schema_change::{ColumnDefinition, Namespace, SchemaChange, SchemaChangeError};
     use crate::staged::{ApplyError, StageError, StagedChange};
     use crate::table::TableName;
     use crate::table_page::{Cell, ColumnName, Filter, Page, TablePage};
@@ -1319,5 +1356,202 @@ mod tests {
             ]
         );
         assert!(client.staged_changes(id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn table_structure_lists_columns_and_indexes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("shop.db");
+        let connection = rusqlite::Connection::open(&db_path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE users (
+                    id INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    email TEXT
+                 );
+                 CREATE UNIQUE INDEX users_email_idx ON users (email);",
+            )
+            .unwrap();
+        drop(connection);
+        let mut client = Client::open(dir.path().join("preferences.json")).unwrap();
+        let id = client.open_session(&connection_at(&db_path)).unwrap();
+        let structure = client.table_structure(id, &users()).unwrap();
+        assert_eq!(structure.columns().len(), 3);
+        assert_eq!(structure.columns()[0].name().as_str(), "id");
+        assert_eq!(structure.columns()[0].type_name(), "INTEGER");
+        assert!(structure.columns()[0].primary_key());
+        assert_eq!(structure.columns()[1].name().as_str(), "name");
+        assert!(structure.columns()[1].not_null());
+        assert_eq!(structure.columns()[2].name().as_str(), "email");
+        assert!(!structure.columns()[2].not_null());
+        let email_index = structure
+            .indexes()
+            .iter()
+            .find(|index| index.name() == "users_email_idx")
+            .expect("email index");
+        assert!(email_index.unique());
+        assert_eq!(email_index.columns(), ["email"]);
+    }
+
+    #[test]
+    fn schema_change_refused_while_staged_changes_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut client, id, _) = open_seeded_client(&dir);
+        let page = client.table_page(id, &users(), &[], Page::first()).unwrap();
+        client
+            .stage_update(
+                id,
+                users(),
+                named_row(&page, 0),
+                vec![(ColumnName::new("name".into()), Cell::Text("zoe".into()))],
+            )
+            .unwrap();
+        let change = SchemaChange::AddColumn {
+            table: users(),
+            column: ColumnDefinition::new("email", "TEXT"),
+        };
+        assert_eq!(
+            client.execute_schema_change(id, &change),
+            Err(SchemaChangeError::StagedChangesExist)
+        );
+        let structure = client.table_structure(id, &users()).unwrap();
+        assert!(
+            !structure
+                .columns()
+                .iter()
+                .any(|column| column.name().as_str() == "email")
+        );
+    }
+
+    #[test]
+    fn schema_change_does_not_enter_staged_bag() {
+        let dir = tempfile::tempdir().unwrap();
+        let (client, id, _) = open_seeded_client(&dir);
+        let change = SchemaChange::AddColumn {
+            table: users(),
+            column: ColumnDefinition::new("email", "TEXT"),
+        };
+        client.execute_schema_change(id, &change).unwrap();
+        assert!(client.staged_changes(id).unwrap().is_empty());
+        let structure = client.table_structure(id, &users()).unwrap();
+        assert!(
+            structure
+                .columns()
+                .iter()
+                .any(|column| column.name().as_str() == "email")
+        );
+    }
+
+    #[test]
+    fn create_table_lands_in_main_namespace_on_sqlite() {
+        let dir = tempfile::tempdir().unwrap();
+        let (client, id, _) = open_seeded_client(&dir);
+        let change = SchemaChange::CreateTable {
+            namespace: Namespace::main(),
+            table: TableName::new("orders".into()),
+            columns: vec![
+                ColumnDefinition::new("id", "INTEGER PRIMARY KEY"),
+                ColumnDefinition::new("total", "INTEGER NOT NULL"),
+            ],
+        };
+        client.execute_schema_change(id, &change).unwrap();
+        let catalog = client.tables(id).unwrap();
+        let names: Vec<_> = catalog
+            .tables()
+            .iter()
+            .map(|table| table.name().as_str())
+            .collect();
+        assert!(names.contains(&"orders"));
+        assert!(names.contains(&"users"));
+    }
+
+    #[test]
+    fn schema_change_forms_execute_on_sqlite() {
+        let dir = tempfile::tempdir().unwrap();
+        let (client, id, _) = open_seeded_client(&dir);
+        client
+            .execute_schema_change(
+                id,
+                &SchemaChange::AddColumn {
+                    table: users(),
+                    column: ColumnDefinition::new("email", "TEXT"),
+                },
+            )
+            .unwrap();
+        client
+            .execute_schema_change(
+                id,
+                &SchemaChange::RenameColumn {
+                    table: users(),
+                    from: ColumnName::new("email".into()),
+                    to: ColumnName::new("mail".into()),
+                },
+            )
+            .unwrap();
+        client
+            .execute_schema_change(
+                id,
+                &SchemaChange::AddIndex {
+                    name: "users_mail_idx".into(),
+                    table: users(),
+                    columns: vec![ColumnName::new("mail".into())],
+                    unique: false,
+                },
+            )
+            .unwrap();
+        let structure = client.table_structure(id, &users()).unwrap();
+        assert!(
+            structure
+                .columns()
+                .iter()
+                .any(|column| column.name().as_str() == "mail")
+        );
+        assert!(
+            structure
+                .indexes()
+                .iter()
+                .any(|index| index.name() == "users_mail_idx")
+        );
+        client
+            .execute_schema_change(
+                id,
+                &SchemaChange::DropIndex {
+                    name: "users_mail_idx".into(),
+                },
+            )
+            .unwrap();
+        client
+            .execute_schema_change(
+                id,
+                &SchemaChange::DropColumn {
+                    table: users(),
+                    column: ColumnName::new("mail".into()),
+                },
+            )
+            .unwrap();
+        let structure = client.table_structure(id, &users()).unwrap();
+        assert!(
+            !structure
+                .columns()
+                .iter()
+                .any(|column| column.name().as_str() == "mail")
+        );
+        assert!(
+            !structure
+                .indexes()
+                .iter()
+                .any(|index| index.name() == "users_mail_idx")
+        );
+        client
+            .execute_schema_change(id, &SchemaChange::DropTable { table: users() })
+            .unwrap();
+        let catalog = client.tables(id).unwrap();
+        assert!(
+            !catalog
+                .tables()
+                .iter()
+                .any(|table| table.name().as_str() == "users")
+        );
     }
 }
