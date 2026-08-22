@@ -1,17 +1,20 @@
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::checkbox::Checkbox;
 use gpui_component::dialog::{DialogClose, DialogFooter};
 use gpui_component::input::{Editor, EditorState, Input, InputEvent, InputState};
 use gpui_component::menu::{ContextMenuExt, DropdownMenu, PopupMenuItem};
 use gpui_component::tab::{Tab, TabBar};
 use gpui_component::table::{Column, DataTable, TableDelegate, TableState};
-use gpui_component::{ActiveTheme, Disableable, IconName, Sizable, WindowExt, h_flex, v_flex};
+use gpui_component::{
+    ActiveTheme, Disableable, IconName, Sizable, Size, WindowExt, h_flex, v_flex,
+};
 use opendb::{
-    Cell, Client, ColumnDefinition, ColumnName, Filter, Namespace, Page, ResultStaging, RowIdentity,
-    SchemaChange, SessionId, SqlKind, StagedChange, StagedChangeId, SystemCatalogPreference, Table,
-    TableCatalog, TableName, TablePage, TABLE_PAGE_SIZE, default_namespace, tables_in_namespace,
+    Cell, Client, ColumnDefinition, ColumnName, Filter, GRID_ROW_HEIGHT_PX, GRID_STRIPE, Namespace,
+    Page, ResultStaging, RowIdentity, SchemaChange, SessionId, SqlKind, StagedChange,
+    StagedChangeId, SystemCatalogPreference, TABLE_PAGE_SIZE, TAB_BAR_HEIGHT_PX, Table,
+    TableCatalog, TableName, TablePage, column_width_px, default_namespace, filter_chips_own_row,
+    staged_inspector_shows_actions, staged_inspector_width_px, tables_in_namespace,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -61,17 +64,27 @@ struct PageGrid {
 
 impl PageGrid {
     fn from_page(page: &TablePage, edit_input: Entity<InputState>, editable: bool) -> Self {
+        let rows = page.rows().to_vec();
+        let columns = page
+            .columns()
+            .iter()
+            .enumerate()
+            .map(|(col_ix, column)| {
+                let name = column.as_str().to_string();
+                let samples: Vec<String> = rows
+                    .iter()
+                    .filter_map(|row| row.get(col_ix).map(cell_label_string))
+                    .collect();
+                let width = column_width_px(&name, &samples);
+                Column::new(name.clone(), name)
+                    .width(px(width))
+                    .min_width(px(width.min(120.)))
+            })
+            .collect();
         Self {
-            columns: page
-                .columns()
-                .iter()
-                .map(|column| {
-                    let name = column.as_str().to_string();
-                    Column::new(name.clone(), name)
-                })
-                .collect(),
+            columns,
             column_names: page.columns().to_vec(),
-            rows: page.rows().to_vec(),
+            rows,
             selected_row: None,
             editing: None,
             pending_insert: None,
@@ -193,11 +206,22 @@ impl TableDelegate for PageGrid {
             .id(("cell", (row_ix as u64) << 32 | col_ix as u64))
             .size_full()
             .px_2()
+            .flex()
+            .items_center()
+            .overflow_hidden()
             .on_click(cx.listener(move |table, _, window, cx| {
                 table.delegate_mut().begin_edit(row_ix, col_ix, window, cx);
                 cx.notify();
             }))
-            .child(text)
+            .child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .child(text),
+            )
             .into_any_element()
     }
 
@@ -1551,12 +1575,7 @@ impl SessionView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let Some(tab) = self.tabs.get(self.active_tab) else {
-            return v_flex()
-                .flex_1()
-                .p_4()
-                .text_color(cx.theme().muted_foreground)
-                .child("Pick a Table, open Structure, or start a Query.")
-                .into_any_element();
+            return v_flex().flex_1().min_h_0().into_any_element();
         };
         match tab.kind.clone() {
             TabKind::Structure { table } => self
@@ -1584,7 +1603,12 @@ impl SessionView {
                     Some(state) => v_flex()
                         .flex_1()
                         .min_h(px(160.))
-                        .child(DataTable::new(&state).stripe(true)),
+                        .min_w_0()
+                        .child(
+                            DataTable::new(&state)
+                                .stripe(GRID_STRIPE)
+                                .with_size(Size::Size(px(GRID_ROW_HEIGHT_PX))),
+                        ),
                     None => v_flex()
                         .flex_1()
                         .p_3()
@@ -1595,6 +1619,7 @@ impl SessionView {
                     .flex_1()
                     .gap_2()
                     .p_2()
+                    .min_w_0()
                     .child(Editor::new(&editor).h(px(140.)))
                     .child(
                         h_flex().gap_2().child(
@@ -1615,56 +1640,69 @@ impl SessionView {
                     .as_ref()
                     .map(|state| state.read(cx).delegate().rows.len())
                     .unwrap_or(0);
-                let mut filter_bar = h_flex().gap_2().px_2().py_1().flex_wrap().items_center();
-                for (index, filter) in filters.iter().enumerate() {
+                let show_filter_row = filter_chips_own_row(filters.len());
+                let mut body = v_flex().flex_1().gap_0().min_w_0().min_h_0();
+                if show_filter_row {
+                    let mut filter_bar = h_flex()
+                        .gap_2()
+                        .px_2()
+                        .h(px(28.))
+                        .flex_wrap()
+                        .items_center()
+                        .border_b_1()
+                        .border_color(cx.theme().border);
+                    for (index, filter) in filters.iter().enumerate() {
+                        filter_bar = filter_bar.child(
+                            h_flex()
+                                .id(("filter-chip", index as u64))
+                                .gap_1()
+                                .px_2()
+                                .py(px(2.))
+                                .rounded(px(4.))
+                                .bg(cx.theme().secondary)
+                                .border_1()
+                                .border_color(cx.theme().border)
+                                .items_center()
+                                .child(div().text_xs().child(filter_label(filter)))
+                                .child(
+                                    Button::new(("remove-filter", index as u64))
+                                        .icon(IconName::Close)
+                                        .ghost()
+                                        .xsmall()
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.remove_filter(index, window, cx);
+                                        })),
+                                ),
+                        );
+                    }
                     filter_bar = filter_bar.child(
-                        h_flex()
-                            .id(("filter-chip", index as u64))
-                            .gap_1()
-                            .px_2()
-                            .py(px(2.))
-                            .rounded(px(4.))
-                            .bg(cx.theme().secondary)
-                            .border_1()
-                            .border_color(cx.theme().border)
-                            .items_center()
-                            .child(div().text_xs().child(filter_label(filter)))
-                            .child(
-                                Button::new(("remove-filter", index as u64))
-                                    .icon(IconName::Close)
-                                    .ghost()
-                                    .xsmall()
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.remove_filter(index, window, cx);
-                                    })),
-                            ),
+                        Button::new("add-filter")
+                            .label("+ Filter")
+                            .ghost()
+                            .xsmall()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_filter_dialog(window, cx);
+                            })),
                     );
+                    body = body.child(filter_bar);
                 }
-                filter_bar = filter_bar.child(
-                    Button::new("add-filter")
-                        .label("+ Filter")
-                        .ghost()
-                        .xsmall()
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.open_filter_dialog(window, cx);
-                        })),
-                );
                 let grid_element = match self.active_grid() {
                     Some(state) => v_flex()
                         .flex_1()
                         .min_h(px(160.))
-                        .child(DataTable::new(&state).stripe(true)),
+                        .min_w_0()
+                        .child(
+                            DataTable::new(&state)
+                                .stripe(GRID_STRIPE)
+                                .with_size(Size::Size(px(GRID_ROW_HEIGHT_PX))),
+                        ),
                     None => v_flex()
                         .flex_1()
                         .p_3()
                         .text_color(cx.theme().muted_foreground)
                         .child("Loading…"),
                 };
-                v_flex()
-                    .flex_1()
-                    .gap_1()
-                    .child(filter_bar)
-                    .child(grid_element)
+                body.child(grid_element)
                     .child(self.render_pagination_bar(page, has_next, row_count, can_stage, cx))
                     .into_any_element()
             }
@@ -1687,36 +1725,22 @@ impl SessionView {
         };
         let end = page.index() * TABLE_PAGE_SIZE + row_count;
         let range_label = if row_count == 0 {
-            "No rows".to_string()
+            "0 rows".to_string()
         } else if has_next {
-            format!("{start} – {end}+")
+            format!("{start}–{end}+")
         } else {
-            format!("{start} – {end}")
+            format!("{start}–{end}")
         };
         let can_prev = page.index() > 0;
+        let status = self.status.clone();
         h_flex()
             .w_full()
+            .h(px(28.))
             .px_2()
-            .py_1()
-            .gap_2()
+            .gap_1()
             .items_center()
             .border_t_1()
             .border_color(cx.theme().border)
-            .child(
-                Button::new("first-page")
-                    .label("«")
-                    .ghost()
-                    .xsmall()
-                    .disabled(!can_prev)
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        if let Some(TabKind::Table { page, .. } | TabKind::Query { page, .. }) =
-                            this.tabs.get_mut(this.active_tab).map(|tab| &mut tab.kind)
-                        {
-                            *page = Page::first();
-                        }
-                        this.reload(window, cx);
-                    })),
-            )
             .child(
                 Button::new("prev-page")
                     .label("‹")
@@ -1738,26 +1762,23 @@ impl SessionView {
                     })),
             )
             .child(
-                Button::new("page-label")
-                    .label(format!("Page {page_number}"))
-                    .ghost()
-                    .xsmall()
-                    .disabled(true),
-            )
-            .child(div().flex_1())
-            .child(
                 div()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child(format!("{TABLE_PAGE_SIZE} rows")),
+                    .child(format!("{page_number} · {range_label}")),
             )
             .child(div().flex_1())
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(range_label),
-            )
+            .when(!status.is_empty(), |bar| {
+                bar.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().danger)
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .child(status),
+                )
+            })
             .child(
                 {
                     let view = cx.entity().downgrade();
@@ -1881,7 +1902,7 @@ impl Render for SessionView {
                     let selected_label = selected
                         .as_ref()
                         .map(|namespace| namespace.as_str().to_string())
-                        .unwrap_or_else(|| "Schema".into());
+                        .unwrap_or_else(|| "Namespace".into());
                     let view = cx.entity().downgrade();
                     let create_namespace = selected
                         .clone()
@@ -1889,62 +1910,87 @@ impl Render for SessionView {
                     schema_picker = Some(
                         h_flex()
                             .w_full()
+                            .h(px(28.))
                             .px_2()
-                            .py_2()
-                            .gap_1()
                             .border_t_1()
                             .border_color(border)
                             .items_center()
                             .child(
-                                Button::new("schema-picker")
-                                    .label(format!("✓ {selected_label}"))
+                                div()
+                                    .id("namespace-control")
                                     .w_full()
-                                    .dropdown_menu({
-                                        let namespaces = namespaces.clone();
-                                        let selected = selected.clone();
+                                    .context_menu({
                                         let view = view.clone();
-                                        move |menu, _, _| {
-                                            let mut menu = menu;
-                                            for namespace in namespaces.iter() {
-                                                let label = if selected.as_ref() == Some(namespace)
-                                                {
-                                                    format!("✓ {}", namespace.as_str())
-                                                } else {
-                                                    format!("  {}", namespace.as_str())
-                                                };
-                                                let namespace = namespace.clone();
-                                                let view = view.clone();
-                                                menu = menu.item(
-                                                    PopupMenuItem::new(label).on_click(move |_, _, cx| {
-                                                        view.update(cx, |this, cx| {
-                                                            this.select_namespace(
-                                                                namespace.clone(),
-                                                                cx,
-                                                            );
-                                                        })
-                                                        .ok();
-                                                    }),
-                                                );
-                                            }
-                                            menu
-                                        }
-                                    }),
-                            )
-                            .child(
-                                Button::new("create-table-sidebar")
-                                    .label("+")
-                                    .ghost()
-                                    .xsmall()
-                                    .on_click(cx.listener({
                                         let namespace = create_namespace;
-                                        move |this, _, window, cx| {
-                                            this.open_create_table_form(
-                                                namespace.clone(),
-                                                window,
-                                                cx,
-                                            );
+                                        move |menu, _, _| {
+                                            menu.item(PopupMenuItem::new("Create Table").on_click({
+                                                let view = view.clone();
+                                                let namespace = namespace.clone();
+                                                move |_, window, cx| {
+                                                    view.update(cx, |this, cx| {
+                                                        this.open_create_table_form(
+                                                            namespace.clone(),
+                                                            window,
+                                                            cx,
+                                                        );
+                                                    })
+                                                    .ok();
+                                                }
+                                            }))
                                         }
-                                    })),
+                                    })
+                                    .child(
+                                        Button::new("schema-picker")
+                                            .label(format!("{selected_label} ▾"))
+                                            .ghost()
+                                            .xsmall()
+                                            .w_full()
+                                            .dropdown_menu({
+                                                let namespaces = namespaces.clone();
+                                                let selected = selected.clone();
+                                                let view = view.clone();
+                                                move |menu, _, _| {
+                                                    let mut menu = menu;
+                                                    for namespace in namespaces.iter() {
+                                                        let checked =
+                                                            selected.as_ref() == Some(namespace);
+                                                        let namespace = namespace.clone();
+                                                        let view = view.clone();
+                                                        menu = menu.item(
+                                                            PopupMenuItem::new(
+                                                                namespace.as_str().to_string(),
+                                                            )
+                                                            .checked(checked)
+                                                            .on_click(move |_, _, cx| {
+                                                                view.update(cx, |this, cx| {
+                                                                    this.select_namespace(
+                                                                        namespace.clone(),
+                                                                        cx,
+                                                                    );
+                                                                })
+                                                                .ok();
+                                                            }),
+                                                        );
+                                                    }
+                                                    menu = menu.separator();
+                                                    menu.item(
+                                                        PopupMenuItem::new("Show System Catalogs")
+                                                            .checked(shown)
+                                                            .on_click({
+                                                                let view = view.clone();
+                                                                move |_, _, cx| {
+                                                                    view.update(cx, |this, cx| {
+                                                                        this.toggle_system_catalogs(
+                                                                            cx,
+                                                                        );
+                                                                    })
+                                                                    .ok();
+                                                                }
+                                                            }),
+                                                    )
+                                                }
+                                            }),
+                                    ),
                             )
                             .into_any_element(),
                     );
@@ -1974,6 +2020,67 @@ impl Render for SessionView {
                     for (index, table) in tables.into_iter().enumerate() {
                         tree = tree.child(table_tree_row(index as u64, table, false, cx));
                     }
+                    let view = cx.entity().downgrade();
+                    schema_picker = Some(
+                        h_flex()
+                            .w_full()
+                            .h(px(28.))
+                            .px_2()
+                            .border_t_1()
+                            .border_color(border)
+                            .items_center()
+                            .child(
+                                div()
+                                    .id("catalog-control")
+                                    .w_full()
+                                    .context_menu({
+                                        let view = view.clone();
+                                        move |menu, _, _| {
+                                            menu.item(PopupMenuItem::new("Create Table").on_click({
+                                                let view = view.clone();
+                                                move |_, window, cx| {
+                                                    view.update(cx, |this, cx| {
+                                                        this.open_create_table_form(
+                                                            Namespace::main(),
+                                                            window,
+                                                            cx,
+                                                        );
+                                                    })
+                                                    .ok();
+                                                }
+                                            }))
+                                        }
+                                    })
+                                    .child(
+                                        Button::new("catalog-picker")
+                                            .label("Catalog ▾")
+                                            .ghost()
+                                            .xsmall()
+                                            .w_full()
+                                            .dropdown_menu({
+                                                let view = view.clone();
+                                                move |menu, _, _| {
+                                                    menu.item(
+                                                        PopupMenuItem::new("Show System Catalogs")
+                                                            .checked(shown)
+                                                            .on_click({
+                                                                let view = view.clone();
+                                                                move |_, _, cx| {
+                                                                    view.update(cx, |this, cx| {
+                                                                        this.toggle_system_catalogs(
+                                                                            cx,
+                                                                        );
+                                                                    })
+                                                                    .ok();
+                                                                }
+                                                            }),
+                                                    )
+                                                }
+                                            }),
+                                    ),
+                            )
+                            .into_any_element(),
+                    );
                 }
             }
             Err(err) => {
@@ -1999,22 +2106,9 @@ impl Render for SessionView {
         if let Some(picker) = schema_picker {
             sidebar = sidebar.child(picker);
         }
-        sidebar = sidebar.child(
-            h_flex()
-                .w_full()
-                .px_2()
-                .py_2()
-                .border_t_1()
-                .border_color(border)
-                .child(
-                    Checkbox::new("system-catalogs")
-                        .label("Show System Catalogs")
-                        .checked(shown)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.toggle_system_catalogs(cx);
-                        })),
-                ),
-        );
+
+        let staged_width = px(staged_inspector_width_px(staged_count));
+        let show_staged_actions = staged_inspector_shows_actions(staged_count);
 
         let mut staged_rows = v_flex()
             .id("staged-list")
@@ -2023,119 +2117,136 @@ impl Render for SessionView {
             .gap_1()
             .p_2()
             .overflow_y_scroll();
-        if staged.is_empty() {
+        for (index, (change_id, icon, label)) in staged.into_iter().enumerate() {
             staged_rows = staged_rows.child(
-                div()
-                    .text_xs()
-                    .text_color(muted)
-                    .child("No Staged Changes."),
-            );
-        } else {
-            for (index, (change_id, icon, label)) in staged.into_iter().enumerate() {
-                staged_rows = staged_rows.child(
-                    h_flex()
-                        .id(("staged", index as u64))
-                        .w_full()
-                        .gap_2()
-                        .items_center()
-                        .px_1()
-                        .py_1()
-                        .rounded(px(4.))
-                        .hover(|style| style.bg(secondary))
-                        .child(
-                            div()
-                                .w(px(18.))
-                                .text_xs()
-                                .text_color(match icon {
-                                    'u' => rgb(0xca8a04),
-                                    'i' => rgb(0x16a34a),
-                                    _ => rgb(0xdc2626),
-                                })
-                                .child(match icon {
-                                    'u' => "✎",
-                                    'i' => "+",
-                                    _ => "⌫",
-                                }),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .text_xs()
-                                .text_color(foreground)
-                                .child(label),
-                        )
-                        .child(
-                            Button::new(("unstage", index as u64))
-                                .label("Unstage")
-                                .ghost()
-                                .xsmall()
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.unstage_one(change_id, cx);
-                                })),
-                        ),
-                );
-            }
-        }
-
-        let staged_pane = v_flex()
-            .w(px(240.))
-            .h_full()
-            .border_l_1()
-            .border_color(border)
-            .child(
                 h_flex()
+                    .id(("staged", index as u64))
                     .w_full()
-                    .px_3()
-                    .py_2()
                     .gap_2()
                     .items_center()
-                    .border_b_1()
-                    .border_color(border)
+                    .px_1()
+                    .py_1()
+                    .rounded(px(4.))
+                    .hover(|style| style.bg(secondary))
                     .child(
                         div()
-                            .text_sm()
-                            .font_weight(FontWeight::MEDIUM)
-                            .child("Staged Changes"),
-                    )
-                    .child(
-                        div()
-                            .px(px(6.))
-                            .rounded(px(999.))
-                            .bg(cx.theme().primary)
-                            .text_color(cx.theme().primary_foreground)
+                            .w(px(18.))
                             .text_xs()
-                            .child(format!("{staged_count}")),
-                    ),
-            )
-            .child(staged_rows)
-            .child(
-                v_flex()
-                    .w_full()
-                    .gap_2()
-                    .p_2()
-                    .border_t_1()
-                    .border_color(border)
-                    .child(
-                        Button::new("apply")
-                            .primary()
-                            .w_full()
-                            .label(format!("Apply ({staged_count})"))
-                            .disabled(staged_count == 0)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.apply_changes(window, cx);
-                            })),
+                            .text_color(match icon {
+                                'u' => rgb(0xca8a04),
+                                'i' => rgb(0x16a34a),
+                                _ => rgb(0xdc2626),
+                            })
+                            .child(match icon {
+                                'u' => "✎",
+                                'i' => "+",
+                                _ => "⌫",
+                            }),
                     )
                     .child(
-                        Button::new("discard-all")
-                            .w_full()
-                            .label("Discard all")
-                            .disabled(staged_count == 0)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.discard_all(cx);
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_xs()
+                            .text_color(foreground)
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(label),
+                    )
+                    .child(
+                        Button::new(("unstage", index as u64))
+                            .label("Unstage")
+                            .ghost()
+                            .xsmall()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.unstage_one(change_id, cx);
                             })),
                     ),
             );
+        }
+
+        let staged_pane = if show_staged_actions {
+            v_flex()
+                .w(staged_width)
+                .h_full()
+                .border_l_1()
+                .border_color(border)
+                .child(
+                    h_flex()
+                        .w_full()
+                        .h(px(28.))
+                        .px_2()
+                        .gap_2()
+                        .items_center()
+                        .border_b_1()
+                        .border_color(border)
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(FontWeight::MEDIUM)
+                                .child("Staged Changes"),
+                        )
+                        .child(
+                            div()
+                                .px(px(6.))
+                                .rounded(px(999.))
+                                .bg(cx.theme().primary)
+                                .text_color(cx.theme().primary_foreground)
+                                .text_xs()
+                                .child(format!("{staged_count}")),
+                        ),
+                )
+                .child(staged_rows)
+                .child(
+                    v_flex()
+                        .w_full()
+                        .gap_2()
+                        .p_2()
+                        .border_t_1()
+                        .border_color(border)
+                        .child(
+                            Button::new("apply")
+                                .primary()
+                                .w_full()
+                                .label(format!("Apply ({staged_count})"))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.apply_changes(window, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("discard-all")
+                                .w_full()
+                                .label("Discard all")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.discard_all(cx);
+                                })),
+                        ),
+                )
+                .into_any_element()
+        } else {
+            v_flex()
+                .w(staged_width)
+                .h_full()
+                .border_l_1()
+                .border_color(border)
+                .items_center()
+                .pt_2()
+                .child(
+                    div()
+                        .w(px(18.))
+                        .h(px(18.))
+                        .rounded(px(999.))
+                        .bg(cx.theme().secondary)
+                        .text_color(muted)
+                        .text_xs()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child("0"),
+                )
+                .into_any_element()
+        };
 
         let tab_labels: Vec<String> = self
             .tabs
@@ -2143,10 +2254,30 @@ impl Render for SessionView {
             .map(|tab| self.tab_label(tab, cx))
             .collect();
 
-        let mut tab_bar = TabBar::new("session-tabs")
-            .menu(true)
-            .selected_index(self.active_tab)
-            .suffix(
+        let active_filter_count = match self.tabs.get(self.active_tab).map(|tab| &tab.kind) {
+            Some(TabKind::Table { filters, .. }) => filters.len(),
+            _ => 0,
+        };
+        let show_tab_filter = matches!(
+            self.tabs.get(self.active_tab).map(|tab| &tab.kind),
+            Some(TabKind::Table { .. })
+        ) && !filter_chips_own_row(active_filter_count);
+
+        let tab_suffix = h_flex()
+            .items_center()
+            .gap_1()
+            .when(show_tab_filter, |row| {
+                row.child(
+                    Button::new("add-filter-tab")
+                        .label("+ Filter")
+                        .ghost()
+                        .xsmall()
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_filter_dialog(window, cx);
+                        })),
+                )
+            })
+            .child(
                 Button::new("new-tab")
                     .icon(IconName::Plus)
                     .ghost()
@@ -2154,7 +2285,13 @@ impl Render for SessionView {
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.add_query_tab(window, cx);
                     })),
-            )
+            );
+
+        let mut tab_bar = TabBar::new("session-tabs")
+            .menu(true)
+            .with_size(Size::XSmall)
+            .selected_index(self.active_tab)
+            .suffix(tab_suffix)
             .on_click(cx.listener(|this, index, _, cx| {
                 this.select_tab(*index, cx);
             }));
@@ -2174,22 +2311,6 @@ impl Render for SessionView {
             );
         }
 
-        let (page_rows, page_index) = match self.tabs.get(self.active_tab).map(|tab| &tab.kind) {
-            Some(TabKind::Table { page, grid, .. }) | Some(TabKind::Query { page, grid, .. }) => (
-                grid.as_ref()
-                    .map(|state| state.read(cx).delegate().rows.len())
-                    .unwrap_or(0),
-                page.index() + 1,
-            ),
-            _ => (0, 1),
-        };
-        let status_left = if self.status.is_empty() {
-            format!("{page_rows} rows · page {page_index} · {staged_count} Staged Changes")
-                .into()
-        } else {
-            self.status.clone()
-        };
-
         let center = v_flex()
             .flex_1()
             .h_full()
@@ -2197,26 +2318,20 @@ impl Render for SessionView {
             .child(
                 h_flex()
                     .w_full()
+                    .h(px(TAB_BAR_HEIGHT_PX))
                     .border_b_1()
                     .border_color(border)
                     .child(tab_bar),
             )
             .child(self.render_active_tab(window, cx));
 
-        v_flex()
+        h_flex()
             .size_full()
             .bg(cx.theme().background)
             .text_color(foreground)
-            .child(h_flex().flex_1().w_full().min_h_0().child(sidebar).child(center).child(staged_pane))
-            .child(
-                h_flex()
-                    .w_full()
-                    .px_3()
-                    .py_1()
-                    .border_t_1()
-                    .border_color(border)
-                    .child(div().text_xs().text_color(muted).child(status_left)),
-            )
+            .child(sidebar)
+            .child(center)
+            .child(staged_pane)
     }
 }
 
@@ -2338,14 +2453,18 @@ fn parse_column_names(text: &str) -> Vec<ColumnName> {
         .collect()
 }
 
-fn cell_label(cell: &Cell) -> SharedString {
+fn cell_label_string(cell: &Cell) -> String {
     match cell {
-        Cell::Null => SharedString::default(),
-        Cell::Integer(value) => value.to_string().into(),
-        Cell::Real(value) => value.to_string().into(),
-        Cell::Text(value) => value.clone().into(),
-        Cell::Blob(value) => format!("<{} bytes>", value.len()).into(),
+        Cell::Null => String::new(),
+        Cell::Integer(value) => value.to_string(),
+        Cell::Real(value) => value.to_string(),
+        Cell::Text(value) => value.clone(),
+        Cell::Blob(value) => format!("<{} bytes>", value.len()),
     }
+}
+
+fn cell_label(cell: &Cell) -> SharedString {
+    cell_label_string(cell).into()
 }
 
 fn cell_edit_text(cell: &Cell) -> String {

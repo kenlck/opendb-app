@@ -551,7 +551,7 @@ fn preferences_path() -> std::path::PathBuf {
 }
 
 fn session_window_options(name: &str, engine: Engine, cx: &App) -> WindowOptions {
-    let title = format!("{name} · {} · Session", engine.label());
+    let title = opendb::session_window_title(name, engine.label());
     WindowOptions {
         window_bounds: Some(WindowBounds::centered(size(px(1100.), px(720.)), cx)),
         titlebar: Some(TitlebarOptions {
