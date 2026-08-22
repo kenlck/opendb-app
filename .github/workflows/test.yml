@@ -10,11 +10,4 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      # Workspace patches Zed gpui over ssh:// so every consumer shares one rev.
-      # GitHub-hosted runners have no deploy key; rewrite to HTTPS and let Cargo
-      # use the git CLI (see .cargo/config.toml) so insteadOf applies.
-      - name: Fetch ssh git deps over HTTPS
-        run: |
-          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
-          git config --global url."https://github.com/".insteadOf "git@github.com:"
       - run: cargo test -p opendb --locked
