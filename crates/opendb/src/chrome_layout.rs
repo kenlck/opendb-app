@@ -64,9 +64,37 @@ pub fn column_width_px(header: &str, cell_texts: impl IntoIterator<Item = impl A
     (PAD_PX + longest as f32 * CHAR_PX).clamp(MIN_PX, MAX_PX)
 }
 
-/// Session window title: `Name · Engine · Session`.
+/// Session window title string for the OS window metadata (task switcher), not a visible titlebar.
 pub fn session_window_title(name: &str, engine_label: &str) -> String {
     format!("{name} · {engine_label} · Session")
+}
+
+/// Connection List window title string for OS window metadata.
+pub fn connection_list_window_title() -> &'static str {
+    "OpenDB"
+}
+
+/// Thin top drag strip height. Enough for GPUI window-move hit testing — not a titleband.
+pub const WINDOW_DRAG_STRIP_HEIGHT_PX: f32 = 6.0;
+
+/// Native OS / GPUI titlebar is hidden; Client chrome owns the top of the window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientWindowChromePolicy {
+    /// Hide the default system titlebar (macOS / Windows).
+    pub appears_transparent: bool,
+    /// Prefer client-side decorations on Linux.
+    pub client_decorations: bool,
+    /// App owns titlebar drag regions instead of the system (macOS).
+    pub app_owns_titlebar_drag: bool,
+}
+
+/// Window chrome policy for Session and Connection List windows.
+pub fn client_window_chrome_policy() -> ClientWindowChromePolicy {
+    ClientWindowChromePolicy {
+        appears_transparent: true,
+        client_decorations: true,
+        app_owns_titlebar_drag: true,
+    }
 }
 
 #[cfg(test)]
@@ -116,5 +144,15 @@ mod tests {
             session_window_title("opendb_pr14", "Postgres"),
             "opendb_pr14 · Postgres · Session"
         );
+    }
+
+    #[test]
+    fn native_titlebar_is_hidden_for_client_chrome() {
+        let policy = client_window_chrome_policy();
+        assert!(policy.appears_transparent);
+        assert!(policy.client_decorations);
+        assert!(policy.app_owns_titlebar_drag);
+        assert_eq!(WINDOW_DRAG_STRIP_HEIGHT_PX, 6.0);
+        assert_eq!(connection_list_window_title(), "OpenDB");
     }
 }

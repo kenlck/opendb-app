@@ -1,4 +1,5 @@
 mod session;
+mod window_chrome;
 
 use std::fs;
 
@@ -16,6 +17,7 @@ use gpui_component::{
 use gpui_component_assets::Assets;
 use opendb::{AddResult, Client, Connection, ConnectionList, ConnectionString, Engine, FileStore};
 use session::SessionView;
+use window_chrome::{connection_list_window_options, session_window_options, window_drag_strip};
 
 actions!(
     connection_list,
@@ -424,94 +426,97 @@ impl Render for ConnectionListView {
             .bg(cx.theme().background)
             .text_color(foreground)
             .child(
-                v_flex().size_full().child(
-                    h_flex()
-                        .w_full()
-                        .px_3()
-                        .py_2()
-                        .border_b_1()
-                        .border_color(border)
-                        .child(
-                            Input::new(&self.filter)
-                                .prefix(IconName::Search)
-                                .suffix(
-                                    Kbd::new(Keystroke::parse("cmd-f").unwrap_or_else(|_| {
-                                        Keystroke::parse("ctrl-f").unwrap()
-                                    }))
-                                    .appearance(false),
-                                ),
-                        ),
-                )
-                .child(rows)
-                .child(
-                    h_flex()
-                        .w_full()
-                        .px_3()
-                        .py_2()
-                        .gap_2()
-                        .border_t_1()
-                        .border_color(border)
-                        .child(
-                            Button::new("open-session")
-                                .primary()
-                                .icon(IconName::SquareTerminal)
-                                .label("Open Session")
-                                .disabled(!open_enabled)
-                                .on_click(cx.listener(|this, _, _, cx| this.open_selected(cx))),
-                        )
-                        .child(
-                            Button::new("add")
-                                .icon(IconName::Plus)
-                                .label("Add")
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.open_add_sheet(window, cx);
-                                })),
-                        )
-                        .child(
-                            Button::new("more")
-                                .label("More")
-                                .icon(IconName::Ellipsis)
-                                .dropdown_caret(true)
-                                .dropdown_menu({
-                                    let view = view.clone();
-                                    move |menu, _, _| {
-                                        menu.item(PopupMenuItem::new("Export").on_click({
-                                            let view = view.clone();
-                                            move |_, _, cx| {
-                                                view.update(cx, |this, cx| this.export(cx))
-                                                    .ok();
-                                            }
+                v_flex()
+                    .size_full()
+                    .child(window_drag_strip(cx))
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .px_3()
+                            .py_2()
+                            .border_b_1()
+                            .border_color(border)
+                            .child(
+                                Input::new(&self.filter)
+                                    .prefix(IconName::Search)
+                                    .suffix(
+                                        Kbd::new(Keystroke::parse("cmd-f").unwrap_or_else(|_| {
+                                            Keystroke::parse("ctrl-f").unwrap()
                                         }))
-                                        .item(PopupMenuItem::new("Import").on_click({
-                                            let view = view.clone();
-                                            move |_, _, cx| {
-                                                view.update(cx, |this, cx| this.import(cx))
-                                                    .ok();
-                                            }
-                                        }))
-                                    }
-                                }),
-                        ),
-                )
-                .child(
-                    h_flex()
-                        .w_full()
-                        .px_3()
-                        .py_1()
-                        .border_t_1()
-                        .border_color(border)
-                        .justify_between()
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(muted)
-                                .child(if self.status.is_empty() {
-                                    self.connection_count_label()
-                                } else {
-                                    self.status.clone()
-                                }),
-                        ),
-                ),
+                                        .appearance(false),
+                                    ),
+                            ),
+                    )
+                    .child(rows)
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .px_3()
+                            .py_2()
+                            .gap_2()
+                            .border_t_1()
+                            .border_color(border)
+                            .child(
+                                Button::new("open-session")
+                                    .primary()
+                                    .icon(IconName::SquareTerminal)
+                                    .label("Open Session")
+                                    .disabled(!open_enabled)
+                                    .on_click(cx.listener(|this, _, _, cx| this.open_selected(cx))),
+                            )
+                            .child(
+                                Button::new("add")
+                                    .icon(IconName::Plus)
+                                    .label("Add")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.open_add_sheet(window, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("more")
+                                    .label("More")
+                                    .icon(IconName::Ellipsis)
+                                    .dropdown_caret(true)
+                                    .dropdown_menu({
+                                        let view = view.clone();
+                                        move |menu, _, _| {
+                                            menu.item(PopupMenuItem::new("Export").on_click({
+                                                let view = view.clone();
+                                                move |_, _, cx| {
+                                                    view.update(cx, |this, cx| this.export(cx))
+                                                        .ok();
+                                                }
+                                            }))
+                                            .item(PopupMenuItem::new("Import").on_click({
+                                                let view = view.clone();
+                                                move |_, _, cx| {
+                                                    view.update(cx, |this, cx| this.import(cx))
+                                                        .ok();
+                                                }
+                                            }))
+                                        }
+                                    }),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .px_3()
+                            .py_1()
+                            .border_t_1()
+                            .border_color(border)
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .child(if self.status.is_empty() {
+                                        self.connection_count_label()
+                                    } else {
+                                        self.status.clone()
+                                    }),
+                            ),
+                    ),
             )
     }
 }
@@ -550,18 +555,6 @@ fn preferences_path() -> std::path::PathBuf {
     app_data_dir().join("preferences.json")
 }
 
-fn session_window_options(name: &str, engine: Engine, cx: &App) -> WindowOptions {
-    let title = opendb::session_window_title(name, engine.label());
-    WindowOptions {
-        window_bounds: Some(WindowBounds::centered(size(px(1100.), px(720.)), cx)),
-        titlebar: Some(TitlebarOptions {
-            title: Some(title.into()),
-            ..Default::default()
-        }),
-        ..Default::default()
-    }
-}
-
 fn main() {
     let app = gpui_platform::application().with_assets(Assets);
     app.run(move |cx| {
@@ -574,14 +567,7 @@ fn main() {
             KeyBinding::new("cmd-f", FocusFilter, Some("ConnectionList")),
             KeyBinding::new("ctrl-f", FocusFilter, Some("ConnectionList")),
         ]);
-        let window_options = WindowOptions {
-            window_bounds: Some(WindowBounds::centered(size(px(520.), px(640.)), cx)),
-            titlebar: Some(TitlebarOptions {
-                title: Some("OpenDB".into()),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
+        let window_options = connection_list_window_options(cx);
         cx.spawn(async move |cx| {
             cx.open_window(window_options, |window, cx| {
                 let client =
