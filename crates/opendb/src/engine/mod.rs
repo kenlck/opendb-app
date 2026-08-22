@@ -1,4 +1,5 @@
 mod common;
+mod mysql;
 mod postgres;
 mod sqlite;
 
@@ -8,6 +9,7 @@ use crate::table::Table;
 use crate::table_page::{Cell, ColumnName, Filter, Page, TablePage};
 use crate::table_structure::TableStructure;
 
+pub(crate) use mysql::{MysqlDatabase, MysqlOpenError};
 pub(crate) use postgres::{PostgresDatabase, PostgresOpenError};
 pub(crate) use sqlite::{SqliteDatabase, SqliteOpenError};
 

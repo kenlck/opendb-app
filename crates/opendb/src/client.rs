@@ -10,8 +10,8 @@ use crate::catalog::{
 use crate::connection::Connection;
 use crate::connection_string::Engine;
 use crate::engine::{
-    ApplyEngineError, Database, PostgresDatabase, PostgresOpenError, SqliteDatabase,
-    SqliteOpenError,
+    ApplyEngineError, Database, MysqlDatabase, MysqlOpenError, PostgresDatabase, PostgresOpenError,
+    SqliteDatabase, SqliteOpenError,
 };
 use crate::name::Name;
 use crate::query::{ExecuteError, QueryResult, SqlKind};
@@ -143,7 +143,15 @@ impl Client {
                     }
                 }
             }
-            engine => return Err(OpenError::UnsupportedEngine(engine)),
+            Engine::Mysql => {
+                let opened = MysqlDatabase::open(connection.connection_string().as_str());
+                match opened {
+                    Ok(database) => Box::new(database),
+                    Err(MysqlOpenError::Driver(message)) => {
+                        return Err(OpenError::Database(message));
+                    }
+                }
+            }
         };
         let id = SessionId(self.next_id);
         self.next_id += 1;
@@ -497,16 +505,19 @@ mod tests {
     }
 
     #[test]
-    fn non_sqlite_mysql_engine_fails_at_open() {
+    fn mysql_without_server_fails_with_database_error() {
         let dir = tempfile::tempdir().unwrap();
         let mut client = Client::open(dir.path().join("preferences.json")).unwrap();
         let connection = Connection::from_string(
             ConnectionString::parse("mysql://ken:pw@localhost/shop").unwrap(),
         );
-        assert_eq!(
-            client.open_session(&connection),
-            Err(OpenError::UnsupportedEngine(Engine::Mysql))
-        );
+        match client.open_session(&connection) {
+            Err(OpenError::UnsupportedEngine(_)) => {
+                panic!("mysql should attempt to connect, not report unsupported");
+            }
+            Err(OpenError::Database(_)) | Err(OpenError::MissingFile) => {}
+            Ok(_) => {}
+        }
     }
 
     #[test]

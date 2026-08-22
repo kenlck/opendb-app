@@ -2,7 +2,7 @@ use sqlparser::ast::{
     Expr, GroupByExpr, ObjectName, Query, Select, SelectItem, SelectItemQualifiedWildcardKind,
     SetExpr, Statement, TableFactor, WildcardAdditionalOptions,
 };
-use sqlparser::dialect::{PostgreSqlDialect, SQLiteDialect};
+use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect, SQLiteDialect};
 use sqlparser::parser::Parser;
 
 use crate::table::Table;
@@ -78,6 +78,10 @@ pub(crate) fn one_table_projection(sql: &str) -> Option<(String, Projection)> {
 
 pub(crate) fn sql_kind_postgres(sql: &str) -> Result<SqlKind, crate::engine::DatabaseError> {
     sql_kind_from_dialect(&PostgreSqlDialect {}, sql)
+}
+
+pub(crate) fn sql_kind_mysql(sql: &str) -> Result<SqlKind, crate::engine::DatabaseError> {
+    sql_kind_from_dialect(&MySqlDialect {}, sql)
 }
 
 pub(crate) fn sql_kind_from_dialect(
