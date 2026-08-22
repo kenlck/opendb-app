@@ -9,6 +9,7 @@ use crate::query::{QueryResult, ResultStaging, SqlKind, identity_present, one_ta
 use crate::staged::{RowIdentity, StagedChange};
 use crate::table::TableName;
 use crate::table_page::{Cell, ColumnName, Filter, Page, TABLE_PAGE_SIZE, TablePage};
+use crate::table_structure::{StructureColumn, StructureIndex, TableStructure};
 
 pub(crate) struct SqliteDatabase {
     connection: Connection,
@@ -199,6 +200,10 @@ impl Database for SqliteDatabase {
         Ok(TablePage::from_fetched(columns, rows))
     }
 
+    fn table_structure(&self, table: &TableName) -> Result<TableStructure, DatabaseError> {
+        table_structure(&self.connection, table)
+    }
+
     fn row_identity(
         &self,
         table: &TableName,
@@ -263,6 +268,71 @@ impl Database for SqliteDatabase {
 
 fn trim_sql(sql: &str) -> &str {
     sql.trim().trim_end_matches(';').trim()
+}
+
+fn table_structure(
+    connection: &Connection,
+    table: &TableName,
+) -> Result<TableStructure, DatabaseError> {
+    let pragma = format!("PRAGMA table_info({})", quote_ident(table.as_str()));
+    let mut statement = connection
+        .prepare(&pragma)
+        .map_err(DatabaseError::from_engine)?;
+    let columns = statement
+        .query_map([], |row| {
+            let name = row.get::<_, String>(1)?;
+            let type_name = row.get::<_, String>(2)?;
+            let not_null = row.get::<_, i64>(3)? != 0;
+            let pk = row.get::<_, i64>(5)?;
+            Ok(StructureColumn::new(
+                ColumnName::new(name),
+                type_name,
+                not_null,
+                pk != 0,
+            ))
+        })
+        .map_err(DatabaseError::from_engine)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(DatabaseError::from_engine)?;
+
+    let list = format!("PRAGMA index_list({})", quote_ident(table.as_str()));
+    let mut statement = connection
+        .prepare(&list)
+        .map_err(DatabaseError::from_engine)?;
+    let index_rows = statement
+        .query_map([], |row| {
+            let name = row.get::<_, String>(1)?;
+            let unique = row.get::<_, i64>(2)? != 0;
+            Ok((name, unique))
+        })
+        .map_err(DatabaseError::from_engine)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(DatabaseError::from_engine)?;
+
+    let mut indexes = Vec::with_capacity(index_rows.len());
+    for (index_name, unique) in index_rows {
+        let info = format!("PRAGMA index_info({})", quote_ident(&index_name));
+        let mut statement = connection
+            .prepare(&info)
+            .map_err(DatabaseError::from_engine)?;
+        let mut index_columns = statement
+            .query_map([], |row| {
+                let seqno = row.get::<_, i64>(0)?;
+                let name = row.get::<_, Option<String>>(2)?;
+                Ok((seqno, name))
+            })
+            .map_err(DatabaseError::from_engine)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(DatabaseError::from_engine)?;
+        index_columns.sort_by_key(|(seqno, _)| *seqno);
+        let columns = index_columns
+            .into_iter()
+            .filter_map(|(_, name)| name)
+            .collect();
+        indexes.push(StructureIndex::new(index_name, unique, columns));
+    }
+
+    Ok(TableStructure::new(columns, indexes))
 }
 
 fn result_staging(connection: &Connection, sql: &str) -> Result<ResultStaging, DatabaseError> {

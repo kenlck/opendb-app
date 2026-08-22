@@ -4,6 +4,7 @@ use crate::query::{QueryResult, SqlKind};
 use crate::staged::{RowIdentity, StagedChange};
 use crate::table::TableName;
 use crate::table_page::{Cell, ColumnName, Filter, Page, TablePage};
+use crate::table_structure::TableStructure;
 
 pub(crate) use sqlite::{SqliteDatabase, SqliteOpenError};
 
@@ -15,6 +16,7 @@ pub(crate) trait Database {
         filters: &[Filter],
         page: Page,
     ) -> Result<TablePage, DatabaseError>;
+    fn table_structure(&self, table: &TableName) -> Result<TableStructure, DatabaseError>;
     fn row_identity(
         &self,
         table: &TableName,

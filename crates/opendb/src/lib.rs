@@ -10,6 +10,7 @@ mod staged;
 mod store;
 mod table;
 mod table_page;
+mod table_structure;
 
 pub use catalog::SystemCatalogPreference;
 pub use client::{CatalogError, Client, CloseResult, OpenError, PreferenceError, SessionId};
@@ -22,3 +23,4 @@ pub use staged::{ApplyError, RowIdentity, StageError, StagedChange, StagedChange
 pub use store::{FileStore, StoreError};
 pub use table::{Table, TableCatalog, TableName};
 pub use table_page::{Cell, ColumnName, Filter, Page, TABLE_PAGE_SIZE, TablePage};
+pub use table_structure::{StructureColumn, StructureIndex, TableStructure};

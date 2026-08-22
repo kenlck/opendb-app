@@ -13,6 +13,7 @@ use crate::query::{ExecuteError, QueryResult, SqlKind};
 use crate::staged::{ApplyError, StageError, StagedChange, StagedChangeId};
 use crate::table::{TableCatalog, TableName};
 use crate::table_page::{Cell, ColumnName, Filter, Page, TablePage};
+use crate::table_structure::TableStructure;
 
 pub struct Client {
     preferences_path: PathBuf,
@@ -178,6 +179,18 @@ impl Client {
         session
             .database
             .table_page(table, filters, page)
+            .map_err(|error| CatalogError::Database(error.to_string()))
+    }
+
+    pub fn table_structure(
+        &self,
+        id: SessionId,
+        table: &TableName,
+    ) -> Result<TableStructure, CatalogError> {
+        let session = self.session(id)?;
+        session
+            .database
+            .table_structure(table)
             .map_err(|error| CatalogError::Database(error.to_string()))
     }
 
@@ -1319,5 +1332,41 @@ mod tests {
             ]
         );
         assert!(client.staged_changes(id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn table_structure_lists_columns_and_indexes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("shop.db");
+        let connection = rusqlite::Connection::open(&db_path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE users (
+                    id INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    email TEXT
+                 );
+                 CREATE UNIQUE INDEX users_email_idx ON users (email);",
+            )
+            .unwrap();
+        drop(connection);
+        let mut client = Client::open(dir.path().join("preferences.json")).unwrap();
+        let id = client.open_session(&connection_at(&db_path)).unwrap();
+        let structure = client.table_structure(id, &users()).unwrap();
+        assert_eq!(structure.columns().len(), 3);
+        assert_eq!(structure.columns()[0].name().as_str(), "id");
+        assert_eq!(structure.columns()[0].type_name(), "INTEGER");
+        assert!(structure.columns()[0].primary_key());
+        assert_eq!(structure.columns()[1].name().as_str(), "name");
+        assert!(structure.columns()[1].not_null());
+        assert_eq!(structure.columns()[2].name().as_str(), "email");
+        assert!(!structure.columns()[2].not_null());
+        let email_index = structure
+            .indexes()
+            .iter()
+            .find(|index| index.name() == "users_email_idx")
+            .expect("email index");
+        assert!(email_index.unique());
+        assert_eq!(email_index.columns(), ["email"]);
     }
 }
