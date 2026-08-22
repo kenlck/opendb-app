@@ -1,4 +1,4 @@
-use crate::table::TableName;
+use crate::table::Table;
 use crate::table_page::{Cell, ColumnName};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -29,19 +29,19 @@ impl RowIdentity {
 pub enum StagedChange {
     Insert {
         id: StagedChangeId,
-        table: TableName,
+        table: Table,
         values: Vec<(ColumnName, Cell)>,
     },
     Update {
         id: StagedChangeId,
-        table: TableName,
+        table: Table,
         identity: RowIdentity,
         last_seen: Vec<(ColumnName, Cell)>,
         new_values: Vec<(ColumnName, Cell)>,
     },
     Delete {
         id: StagedChangeId,
-        table: TableName,
+        table: Table,
         identity: RowIdentity,
         last_seen: Vec<(ColumnName, Cell)>,
     },
@@ -54,7 +54,7 @@ impl StagedChange {
         }
     }
 
-    pub fn table(&self) -> &TableName {
+    pub fn table(&self) -> &Table {
         match self {
             Self::Insert { table, .. }
             | Self::Update { table, .. }

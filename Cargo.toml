@@ -17,6 +17,7 @@ url = "2"
 directories = "6"
 tempfile = "3"
 rusqlite = { version = "0.32", features = ["bundled"] }
+postgres = "0.19"
 
 gpui = { git = "https://github.com/zed-industries/zed", rev = "e0931d5a9dbf4f781b336fdf448739e74a2ac0b5" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "e0931d5a9dbf4f781b336fdf448739e74a2ac0b5", features = ["font-kit"] }

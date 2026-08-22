@@ -1,25 +1,29 @@
+mod common;
+mod postgres;
 mod sqlite;
 
 use crate::query::{QueryResult, SqlKind};
 use crate::staged::{RowIdentity, StagedChange};
-use crate::table::TableName;
+use crate::table::Table;
 use crate::table_page::{Cell, ColumnName, Filter, Page, TablePage};
 use crate::table_structure::TableStructure;
 
+pub(crate) use postgres::{PostgresDatabase, PostgresOpenError};
 pub(crate) use sqlite::{SqliteDatabase, SqliteOpenError};
 
 pub(crate) trait Database {
-    fn list_table_names(&self) -> Result<Vec<TableName>, DatabaseError>;
+    fn namespaces_grouped(&self) -> bool;
+    fn list_tables(&self) -> Result<Vec<Table>, DatabaseError>;
     fn table_page(
         &self,
-        table: &TableName,
+        table: &Table,
         filters: &[Filter],
         page: Page,
     ) -> Result<TablePage, DatabaseError>;
-    fn table_structure(&self, table: &TableName) -> Result<TableStructure, DatabaseError>;
+    fn table_structure(&self, table: &Table) -> Result<TableStructure, DatabaseError>;
     fn row_identity(
         &self,
-        table: &TableName,
+        table: &Table,
         row: &[(ColumnName, Cell)],
     ) -> Result<Option<RowIdentity>, DatabaseError>;
     fn apply_staged(&self, changes: &[StagedChange]) -> Result<(), ApplyEngineError>;

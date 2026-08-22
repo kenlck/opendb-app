@@ -2,10 +2,10 @@ use sqlparser::ast::{
     Expr, GroupByExpr, ObjectName, Query, Select, SelectItem, SelectItemQualifiedWildcardKind,
     SetExpr, Statement, TableFactor, WildcardAdditionalOptions,
 };
-use sqlparser::dialect::SQLiteDialect;
+use sqlparser::dialect::{PostgreSqlDialect, SQLiteDialect};
 use sqlparser::parser::Parser;
 
-use crate::table::TableName;
+use crate::table::Table;
 use crate::table_page::{Cell, ColumnName, TablePage};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -17,7 +17,7 @@ pub enum SqlKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ResultStaging {
     ReadOnly,
-    Staged { table: TableName },
+    Staged { table: Table },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -73,7 +73,33 @@ pub(crate) enum Projection {
 }
 
 pub(crate) fn one_table_projection(sql: &str) -> Option<(String, Projection)> {
-    let statements = Parser::parse_sql(&SQLiteDialect {}, sql).ok()?;
+    projection_from_sql(&SQLiteDialect {}, sql)
+}
+
+pub(crate) fn sql_kind_postgres(sql: &str) -> Result<SqlKind, crate::engine::DatabaseError> {
+    sql_kind_from_dialect(&PostgreSqlDialect {}, sql)
+}
+
+pub(crate) fn sql_kind_from_dialect(
+    dialect: &dyn sqlparser::dialect::Dialect,
+    sql: &str,
+) -> Result<SqlKind, crate::engine::DatabaseError> {
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    if trimmed.is_empty() {
+        return Err(crate::engine::DatabaseError::from_engine("empty SQL"));
+    }
+    let statements = Parser::parse_sql(dialect, trimmed)
+        .map_err(crate::engine::DatabaseError::from_engine)?;
+    for statement in statements {
+        if !matches!(statement, Statement::Query(_)) {
+            return Ok(SqlKind::Mutating);
+        }
+    }
+    Ok(SqlKind::Read)
+}
+
+fn projection_from_sql(dialect: &dyn sqlparser::dialect::Dialect, sql: &str) -> Option<(String, Projection)> {
+    let statements = Parser::parse_sql(dialect, sql).ok()?;
     if statements.len() != 1 {
         return None;
     }

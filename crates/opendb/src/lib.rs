@@ -25,6 +25,6 @@ pub use schema_change::{
 };
 pub use staged::{ApplyError, RowIdentity, StageError, StagedChange, StagedChangeId};
 pub use store::{FileStore, StoreError};
-pub use table::{Table, TableCatalog, TableName};
+pub use table::{NamespaceGroup, Table, TableCatalog, TableName};
 pub use table_page::{Cell, ColumnName, Filter, Page, TABLE_PAGE_SIZE, TablePage};
 pub use table_structure::{StructureColumn, StructureIndex, TableStructure};

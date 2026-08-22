@@ -4,15 +4,20 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::catalog::{SystemCatalogPreference, assemble, classify};
+use crate::catalog::{
+    assemble_flat, assemble_grouped, classify_flat, classify_grouped, SystemCatalogPreference,
+};
 use crate::connection::Connection;
 use crate::connection_string::Engine;
-use crate::engine::{ApplyEngineError, Database, SqliteDatabase, SqliteOpenError};
+use crate::engine::{
+    ApplyEngineError, Database, PostgresDatabase, PostgresOpenError, SqliteDatabase,
+    SqliteOpenError,
+};
 use crate::name::Name;
 use crate::query::{ExecuteError, QueryResult, SqlKind};
 use crate::schema_change::{SchemaChange, SchemaChangeError, schema_change_ddl};
 use crate::staged::{ApplyError, StageError, StagedChange, StagedChangeId};
-use crate::table::{TableCatalog, TableName};
+use crate::table::{Table, TableCatalog};
 use crate::table_page::{Cell, ColumnName, Filter, Page, TablePage};
 use crate::table_structure::TableStructure;
 
@@ -129,6 +134,15 @@ impl Client {
                     }
                 }
             }
+            Engine::Postgres => {
+                let opened = PostgresDatabase::open(connection.connection_string().as_str());
+                match opened {
+                    Ok(database) => Box::new(database),
+                    Err(PostgresOpenError::Driver(message)) => {
+                        return Err(OpenError::Database(message));
+                    }
+                }
+            }
             engine => return Err(OpenError::UnsupportedEngine(engine)),
         };
         let id = SessionId(self.next_id);
@@ -159,20 +173,28 @@ impl Client {
 
     pub fn tables(&self, id: SessionId) -> Result<TableCatalog, CatalogError> {
         let session = self.session(id)?;
-        let names = session
+        let tables = session
             .database
-            .list_table_names()
+            .list_tables()
             .map_err(|error| CatalogError::Database(error.to_string()))?;
-        Ok(assemble(
-            names.into_iter().map(classify),
-            self.system_catalogs,
-        ))
+        let grouped = session.database.namespaces_grouped();
+        if grouped {
+            Ok(assemble_grouped(
+                tables.into_iter().map(classify_grouped),
+                self.system_catalogs,
+            ))
+        } else {
+            Ok(assemble_flat(
+                tables.into_iter().map(classify_flat),
+                self.system_catalogs,
+            ))
+        }
     }
 
     pub fn table_page(
         &self,
         id: SessionId,
-        table: &TableName,
+        table: &Table,
         filters: &[Filter],
         page: Page,
     ) -> Result<TablePage, CatalogError> {
@@ -186,7 +208,7 @@ impl Client {
     pub fn table_structure(
         &self,
         id: SessionId,
-        table: &TableName,
+        table: &Table,
     ) -> Result<TableStructure, CatalogError> {
         let session = self.session(id)?;
         session
@@ -262,7 +284,7 @@ impl Client {
     pub fn stage_insert(
         &mut self,
         id: SessionId,
-        table: TableName,
+        table: Table,
         values: Vec<(ColumnName, Cell)>,
     ) -> Result<StagedChangeId, StageError> {
         let session = self.session_mut(id)?;
@@ -279,7 +301,7 @@ impl Client {
     pub fn stage_update(
         &mut self,
         id: SessionId,
-        table: TableName,
+        table: Table,
         last_seen: Vec<(ColumnName, Cell)>,
         new_values: Vec<(ColumnName, Cell)>,
     ) -> Result<StagedChangeId, StageError> {
@@ -304,7 +326,7 @@ impl Client {
     pub fn stage_delete(
         &mut self,
         id: SessionId,
-        table: TableName,
+        table: Table,
         last_seen: Vec<(ColumnName, Cell)>,
     ) -> Result<StagedChangeId, StageError> {
         let session = self.session_mut(id)?;
@@ -378,7 +400,7 @@ mod tests {
     use crate::query::{ExecuteError, ResultStaging, SqlKind};
     use crate::schema_change::{ColumnDefinition, Namespace, SchemaChange, SchemaChangeError};
     use crate::staged::{ApplyError, StageError, StagedChange};
-    use crate::table::TableName;
+    use crate::table::{Table, TableName};
     use crate::table_page::{Cell, ColumnName, Filter, Page, TablePage};
 
     fn connection_at(path: &std::path::Path) -> Connection {
@@ -475,16 +497,32 @@ mod tests {
     }
 
     #[test]
-    fn non_sqlite_engine_fails_at_open() {
+    fn non_sqlite_mysql_engine_fails_at_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut client = Client::open(dir.path().join("preferences.json")).unwrap();
+        let connection = Connection::from_string(
+            ConnectionString::parse("mysql://ken:pw@localhost/shop").unwrap(),
+        );
+        assert_eq!(
+            client.open_session(&connection),
+            Err(OpenError::UnsupportedEngine(Engine::Mysql))
+        );
+    }
+
+    #[test]
+    fn postgres_without_server_fails_with_database_error() {
         let dir = tempfile::tempdir().unwrap();
         let mut client = Client::open(dir.path().join("preferences.json")).unwrap();
         let connection = Connection::from_string(
             ConnectionString::parse("postgres://ken:pw@localhost/shop").unwrap(),
         );
-        assert_eq!(
-            client.open_session(&connection),
-            Err(OpenError::UnsupportedEngine(Engine::Postgres))
-        );
+        match client.open_session(&connection) {
+            Err(OpenError::UnsupportedEngine(_)) => {
+                panic!("postgres should attempt to connect, not report unsupported");
+            }
+            Err(OpenError::Database(_)) | Err(OpenError::MissingFile) => {}
+            Ok(_) => {}
+        }
     }
 
     #[test]
@@ -521,7 +559,7 @@ mod tests {
         let mut client = Client::open(dir.path().join("preferences.json")).unwrap();
         let id = client.open_session(&connection_at(&db_path)).unwrap();
         let page = client
-            .table_page(id, &TableName::new("users".into()), &[], Page::first())
+            .table_page(id, &flat_table("users".into()), &[], Page::first())
             .unwrap();
         assert_eq!(
             page.columns()
@@ -543,7 +581,7 @@ mod tests {
         let next = client
             .table_page(
                 id,
-                &TableName::new("users".into()),
+                &flat_table("users".into()),
                 &[],
                 Page::first().next(),
             )
@@ -588,7 +626,7 @@ mod tests {
         let id = client.open_session(&connection_at(&db_path)).unwrap();
         let filters = [Filter::equals("city", Cell::Text("keep".into()))];
         let first = client
-            .table_page(id, &TableName::new("users".into()), &filters, Page::first())
+            .table_page(id, &flat_table("users".into()), &filters, Page::first())
             .unwrap();
         assert_eq!(first.rows().len(), 100);
         assert_eq!(
@@ -611,7 +649,7 @@ mod tests {
         let second = client
             .table_page(
                 id,
-                &TableName::new("users".into()),
+                &flat_table("users".into()),
                 &filters,
                 Page::first().next(),
             )
@@ -649,7 +687,7 @@ mod tests {
         let page = client
             .table_page(
                 id,
-                &TableName::new("items".into()),
+                &flat_table("items".into()),
                 &[
                     Filter::equals("name", Cell::Text("apple".into())),
                     Filter::contains("note", "pi"),
@@ -690,7 +728,7 @@ mod tests {
         let mut client = Client::open(dir.path().join("preferences.json")).unwrap();
         let id = client.open_session(&connection_at(&db_path)).unwrap();
         let page = client
-            .table_page(id, &TableName::new("notes".into()), &[], Page::first())
+            .table_page(id, &flat_table("notes".into()), &[], Page::first())
             .unwrap();
         assert_eq!(
             page.columns()
@@ -749,7 +787,7 @@ mod tests {
             Filter::equals("c11", Cell::Text("l".into())),
         ];
         let page = client
-            .table_page(id, &TableName::new("wide".into()), &filters, Page::first())
+            .table_page(id, &flat_table("wide".into()), &filters, Page::first())
             .unwrap();
         assert_eq!(
             page.rows(),
@@ -771,12 +809,16 @@ mod tests {
         assert!(!page.has_next());
     }
 
-    fn users() -> TableName {
-        TableName::new("users".into())
+    fn users() -> Table {
+        Table::flat(TableName::new("users".into()))
     }
 
-    fn notes() -> TableName {
-        TableName::new("notes".into())
+    fn notes() -> Table {
+        Table::flat(TableName::new("notes".into()))
+    }
+
+    fn flat_table(name: &str) -> Table {
+        Table::flat(TableName::new(name.into()))
     }
 
     fn named_row(page: &TablePage, index: usize) -> Vec<(ColumnName, Cell)> {

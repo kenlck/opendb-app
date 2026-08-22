@@ -9,7 +9,7 @@ use gpui_component::{ActiveTheme, Disableable, IconName, Sizable, WindowExt, h_f
 use opendb::{
     Cell, Client, ColumnDefinition, ColumnName, Filter, Namespace, Page, ResultStaging,
     SchemaChange, SessionId, SqlKind, StagedChange, StagedChangeId, SystemCatalogPreference,
-    TableName, TablePage,
+    Table, TableName, TablePage,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -22,7 +22,7 @@ enum DraftKind {
 #[derive(Clone, PartialEq)]
 enum TabKind {
     Table {
-        table: TableName,
+        table: Table,
         filters: Vec<Filter>,
         page: Page,
         has_next: bool,
@@ -37,7 +37,7 @@ enum TabKind {
         grid: Option<Entity<TableState<PageGrid>>>,
     },
     Structure {
-        table: TableName,
+        table: Table,
     },
 }
 
@@ -358,7 +358,7 @@ impl SessionView {
         cx.notify();
     }
 
-    fn add_table_tab(&mut self, table: TableName, window: &mut Window, cx: &mut Context<Self>) {
+    fn add_table_tab(&mut self, table: Table, window: &mut Window, cx: &mut Context<Self>) {
         self.tabs.push(SessionTab {
             id: self.next_tab_id,
             kind: TabKind::Table {
@@ -376,7 +376,7 @@ impl SessionView {
 
     fn add_structure_tab(
         &mut self,
-        table: TableName,
+        table: Table,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -431,7 +431,7 @@ impl SessionView {
 
     fn tab_label(&self, tab: &SessionTab, cx: &App) -> String {
         match &tab.kind {
-            TabKind::Table { table, .. } => table.as_str().to_string(),
+            TabKind::Table { table, .. } => table_label(table),
             TabKind::Query { editor, .. } => {
                 let sql = editor.read(cx).value();
                 let trimmed = sql.trim();
@@ -442,7 +442,7 @@ impl SessionView {
                     truncate_label(line, 40)
                 }
             }
-            TabKind::Structure { table } => format!("{} (structure)", table.as_str()),
+            TabKind::Structure { table } => format!("{} (structure)", table_label(table)),
         }
     }
 
@@ -511,7 +511,7 @@ impl SessionView {
         self.reload(window, cx);
     }
 
-    fn active_table(&self) -> Option<TableName> {
+    fn active_table(&self) -> Option<Table> {
         match self.tabs.get(self.active_tab).map(|tab| &tab.kind) {
             Some(TabKind::Table { table, .. }) => Some(table.clone()),
             Some(TabKind::Query {
@@ -979,14 +979,22 @@ impl SessionView {
         }
     }
 
-    fn open_create_table_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_create_table_form(
+        &mut self,
+        namespace: Namespace,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let session = cx.entity().downgrade();
         let table_input = self.schema_table_input.clone();
         let columns_input = self.schema_columns_input.clone();
+        let namespace_label = namespace.as_str().to_string();
         window.open_dialog(cx, move |dialog, _, _| {
             dialog
                 .title("Create Table")
-                .child("Table lands in the main Namespace on SQLite.")
+                .child(format!(
+                    "Table lands in the {namespace_label} Namespace."
+                ))
                 .child(Input::new(&table_input))
                 .child("One column per line: name TYPE")
                 .child(Input::new(&columns_input))
@@ -996,6 +1004,7 @@ impl SessionView {
                             let session = session.clone();
                             let table_input = table_input.clone();
                             let columns_input = columns_input.clone();
+                            let namespace = namespace.clone();
                             move |_, window, cx| {
                                 session
                                     .update(cx, |this, cx| {
@@ -1010,7 +1019,7 @@ impl SessionView {
                                             return;
                                         }
                                         let change = SchemaChange::CreateTable {
-                                            namespace: Namespace::main(),
+                                            namespace: namespace.clone(),
                                             table: TableName::new(name),
                                             columns,
                                         };
@@ -1027,7 +1036,7 @@ impl SessionView {
 
     fn open_add_column_form(
         &mut self,
-        table: TableName,
+        table: Table,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1036,7 +1045,7 @@ impl SessionView {
         let type_input = self.schema_column_type_input.clone();
         window.open_dialog(cx, move |dialog, _, _| {
             dialog
-                .title(format!("Add column to {}", table.as_str()))
+                .title(format!("Add column to {}", table_label(&table)))
                 .child(Input::new(&name_input))
                 .child(Input::new(&type_input))
                 .footer(
@@ -1074,7 +1083,7 @@ impl SessionView {
 
     fn open_rename_column_form(
         &mut self,
-        table: TableName,
+        table: Table,
         from: ColumnName,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -1089,7 +1098,7 @@ impl SessionView {
                 .title(format!(
                     "Rename column {} on {}",
                     from.as_str(),
-                    table.as_str()
+                    table_label(&table)
                 ))
                 .child(Input::new(&rename_input))
                 .footer(
@@ -1126,7 +1135,7 @@ impl SessionView {
 
     fn open_add_index_form(
         &mut self,
-        table: TableName,
+        table: Table,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1136,7 +1145,7 @@ impl SessionView {
         let unique = self.schema_unique_index;
         window.open_dialog(cx, move |dialog, _, _| {
             dialog
-                .title(format!("Add index on {}", table.as_str()))
+                .title(format!("Add index on {}", table_label(&table)))
                 .child(Input::new(&name_input))
                 .child(Input::new(&columns_input))
                 .child(
@@ -1197,7 +1206,7 @@ impl SessionView {
 
     fn render_structure(
         &mut self,
-        table: &TableName,
+        table: &Table,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -1516,21 +1525,16 @@ impl SessionView {
 
 impl Render for SessionView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let (shown, title, table_names, staged) = {
+        let (shown, title, catalog, staged) = {
             let client = self.client.read(cx);
             let shown = client.show_system_catalogs() == SystemCatalogPreference::Shown;
             let title = client
                 .session_name(self.session_id)
                 .map(|name| name.as_str().to_string())
                 .unwrap_or_else(|_| "Session".into());
-            let table_names = match client.tables(self.session_id) {
-                Ok(catalog) => Ok(catalog
-                    .tables()
-                    .iter()
-                    .map(|table| table.name().clone())
-                    .collect::<Vec<_>>()),
-                Err(err) => Err(format!("{err}")),
-            };
+            let catalog = client
+                .tables(self.session_id)
+                .map_err(|err| format!("{err}"));
             let staged = client
                 .staged_changes(self.session_id)
                 .map(|changes| {
@@ -1540,35 +1544,64 @@ impl Render for SessionView {
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
-            (shown, title, table_names, staged)
+            (shown, title, catalog, staged)
         };
 
         let mut tables = v_flex().gap_1().w(px(220.));
-        match table_names {
-            Ok(names) if names.is_empty() => {
-                tables = tables.child("No Tables.");
+        match catalog {
+            Ok(catalog) if catalog.tables().is_empty() => {
+                let namespace = if catalog.is_grouped() {
+                    Namespace::new("public")
+                } else {
+                    Namespace::main()
+                };
+                tables = tables.child("No Tables.").child(
+                    Button::new("create-table").label("Create Table").on_click(
+                        cx.listener(move |this, _, window, cx| {
+                            this.open_create_table_form(namespace.clone(), window, cx);
+                        }),
+                    ),
+                );
             }
-            Ok(names) => {
-                for (index, name) in names.into_iter().enumerate() {
-                    let table = name.clone();
+            Ok(catalog) => {
+                if let Some(groups) = catalog.namespace_groups() {
+                    for (group_index, group) in groups.iter().enumerate() {
+                        let namespace = group.namespace().clone();
+                        tables = tables.child(
+                            h_flex().gap_1().child(namespace.as_str().to_string()).child(
+                                Button::new(("create-in-namespace", group_index as u64))
+                                    .label("Create Table")
+                                    .on_click(cx.listener({
+                                        let namespace = namespace.clone();
+                                        move |this, _, window, cx| {
+                                            this.open_create_table_form(
+                                                namespace.clone(),
+                                                window,
+                                                cx,
+                                            );
+                                        }
+                                    })),
+                            ),
+                        );
+                        for (index, table) in group.tables().iter().enumerate() {
+                            tables = tables.child(table_row(
+                                ((group_index as u64) << 16) | index as u64,
+                                table.clone(),
+                                cx,
+                            ));
+                        }
+                    }
+                } else {
                     tables = tables.child(
-                        h_flex().gap_1().child(
-                            Button::new(("table", index as u64))
-                                .label(name.as_str().to_string())
-                                .on_click(cx.listener({
-                                    let table = table.clone();
-                                    move |this, _, window, cx| {
-                                        this.add_table_tab(table.clone(), window, cx);
-                                    }
-                                })),
-                        ).child(
-                            Button::new(("structure", index as u64))
-                                .label("Structure")
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.add_structure_tab(table.clone(), window, cx);
-                                })),
-                        ),
+                        Button::new("create-table")
+                            .label("Create Table")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_create_table_form(Namespace::main(), window, cx);
+                            })),
                     );
+                    for (index, table) in catalog.tables().iter().enumerate() {
+                        tables = tables.child(table_row(index as u64, table.clone(), cx));
+                    }
                 }
             }
             Err(err) => {
@@ -1634,13 +1667,6 @@ impl Render for SessionView {
             .bg(cx.theme().background)
             .child(title)
             .child(
-                Button::new("create-table")
-                    .label("Create Table")
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.open_create_table_form(window, cx);
-                    })),
-            )
-            .child(
                 Button::new("system-catalogs")
                     .label(if shown {
                         "Hide System Catalogs"
@@ -1671,6 +1697,34 @@ fn active_tab_stage_error(tabs: &[SessionTab], active_tab: usize) -> SharedStrin
         Some(TabKind::Structure { .. }) => "Open a Table or staged Result Tab first.".into(),
         _ => "Open a Table or staged Result Tab first.".into(),
     }
+}
+
+fn table_label(table: &Table) -> String {
+    match table.namespace() {
+        Some(namespace) => format!("{}.{}", namespace.as_str(), table.name().as_str()),
+        None => table.name().as_str().to_string(),
+    }
+}
+
+fn table_row(index: u64, table: Table, cx: &mut Context<SessionView>) -> impl IntoElement {
+    let for_structure = table.clone();
+    h_flex()
+        .gap_1()
+        .child(
+            Button::new(("table", index))
+                .label(table.name().as_str().to_string())
+                .on_click(cx.listener({
+                    let table = table.clone();
+                    move |this, _, window, cx| {
+                        this.add_table_tab(table.clone(), window, cx);
+                    }
+                })),
+        )
+        .child(Button::new(("structure", index)).label("Structure").on_click(
+            cx.listener(move |this, _, window, cx| {
+                this.add_structure_tab(for_structure.clone(), window, cx);
+            }),
+        ))
 }
 
 fn truncate_label(text: &str, max_chars: usize) -> String {
@@ -1751,9 +1805,9 @@ fn cell_from_input(original: &Cell, text: &str) -> Cell {
 
 fn change_label(change: &StagedChange) -> String {
     match change {
-        StagedChange::Insert { table, .. } => format!("Insert into {}", table.as_str()),
-        StagedChange::Update { table, .. } => format!("Update {}", table.as_str()),
-        StagedChange::Delete { table, .. } => format!("Delete from {}", table.as_str()),
+        StagedChange::Insert { table, .. } => format!("Insert into {}", table_label(table)),
+        StagedChange::Update { table, .. } => format!("Update {}", table_label(table)),
+        StagedChange::Delete { table, .. } => format!("Delete from {}", table_label(table)),
     }
 }
 

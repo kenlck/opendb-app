@@ -1,4 +1,4 @@
-use crate::table::TableName;
+use crate::table::{Table, TableName};
 use crate::table_page::ColumnName;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -18,24 +18,24 @@ pub enum SchemaChange {
         columns: Vec<ColumnDefinition>,
     },
     DropTable {
-        table: TableName,
+        table: Table,
     },
     AddColumn {
-        table: TableName,
+        table: Table,
         column: ColumnDefinition,
     },
     DropColumn {
-        table: TableName,
+        table: Table,
         column: ColumnName,
     },
     RenameColumn {
-        table: TableName,
+        table: Table,
         from: ColumnName,
         to: ColumnName,
     },
     AddIndex {
         name: String,
-        table: TableName,
+        table: Table,
         columns: Vec<ColumnName>,
         unique: bool,
     },
@@ -57,6 +57,10 @@ pub enum SchemaChangeError {
 impl Namespace {
     pub fn main() -> Self {
         Self("main".into())
+    }
+
+    pub fn new(name: impl Into<String>) -> Self {
+        Self(name.into())
     }
 
     pub fn as_str(&self) -> &str {
@@ -88,7 +92,7 @@ pub fn schema_change_ddl(change: &SchemaChange) -> String {
             table,
             columns,
         } => {
-            let table_sql = qualified_table(namespace, table);
+            let table_sql = qualified_table_for_create(namespace, table);
             let column_sql = columns
                 .iter()
                 .map(|column| {
@@ -103,22 +107,22 @@ pub fn schema_change_ddl(change: &SchemaChange) -> String {
             format!("CREATE TABLE {table_sql} ({column_sql})")
         }
         SchemaChange::DropTable { table } => {
-            format!("DROP TABLE {}", quote_ident(table.as_str()))
+            format!("DROP TABLE {}", qualified_table(table))
         }
         SchemaChange::AddColumn { table, column } => format!(
             "ALTER TABLE {} ADD COLUMN {} {}",
-            quote_ident(table.as_str()),
+            qualified_table(table),
             quote_ident(column.name().as_str()),
             column.type_sql()
         ),
         SchemaChange::DropColumn { table, column } => format!(
             "ALTER TABLE {} DROP COLUMN {}",
-            quote_ident(table.as_str()),
+            qualified_table(table),
             quote_ident(column.as_str())
         ),
         SchemaChange::RenameColumn { table, from, to } => format!(
             "ALTER TABLE {} RENAME COLUMN {} TO {}",
-            quote_ident(table.as_str()),
+            qualified_table(table),
             quote_ident(from.as_str()),
             quote_ident(to.as_str())
         ),
@@ -137,14 +141,14 @@ pub fn schema_change_ddl(change: &SchemaChange) -> String {
             format!(
                 "CREATE {unique}INDEX {} ON {} ({column_sql})",
                 quote_ident(name),
-                quote_ident(table.as_str())
+                qualified_table(table)
             )
         }
         SchemaChange::DropIndex { name } => format!("DROP INDEX {}", quote_ident(name)),
     }
 }
 
-fn qualified_table(namespace: &Namespace, table: &TableName) -> String {
+fn qualified_table_for_create(namespace: &Namespace, table: &TableName) -> String {
     if namespace.as_str() == "main" {
         quote_ident(table.as_str())
     } else {
@@ -153,6 +157,13 @@ fn qualified_table(namespace: &Namespace, table: &TableName) -> String {
             quote_ident(namespace.as_str()),
             quote_ident(table.as_str())
         )
+    }
+}
+
+fn qualified_table(table: &Table) -> String {
+    match table.namespace() {
+        None => quote_ident(table.name().as_str()),
+        Some(namespace) => qualified_table_for_create(namespace, table.name()),
     }
 }
 
@@ -174,7 +185,11 @@ fn quote_ident(name: &str) -> String {
 mod tests {
     use super::*;
 
-    fn orders() -> TableName {
+    fn orders() -> Table {
+        Table::flat(TableName::new("orders".into()))
+    }
+
+    fn orders_name() -> TableName {
         TableName::new("orders".into())
     }
 
@@ -182,7 +197,7 @@ mod tests {
     fn create_table_ddl_uses_main_namespace_on_sqlite() {
         let ddl = schema_change_ddl(&SchemaChange::CreateTable {
             namespace: Namespace::main(),
-            table: orders(),
+            table: orders_name(),
             columns: vec![
                 ColumnDefinition::new("id", "INTEGER PRIMARY KEY"),
                 ColumnDefinition::new("total", "INTEGER NOT NULL"),
@@ -198,7 +213,7 @@ mod tests {
     fn create_table_ddl_qualifies_non_main_namespace() {
         let ddl = schema_change_ddl(&SchemaChange::CreateTable {
             namespace: Namespace("public".into()),
-            table: orders(),
+            table: orders_name(),
             columns: vec![ColumnDefinition::new("id", "INTEGER PRIMARY KEY")],
         });
         assert_eq!(

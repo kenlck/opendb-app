@@ -7,7 +7,7 @@ use url::Url;
 use super::{ApplyEngineError, Database, DatabaseError};
 use crate::query::{QueryResult, ResultStaging, SqlKind, identity_present, one_table_projection};
 use crate::staged::{RowIdentity, StagedChange};
-use crate::table::TableName;
+use crate::table::{Table, TableName};
 use crate::table_page::{Cell, ColumnName, Filter, Page, TABLE_PAGE_SIZE, TablePage};
 use crate::table_structure::{StructureColumn, StructureIndex, TableStructure};
 
@@ -127,7 +127,11 @@ fn push_filters(filters: &[Filter], sql: &mut String, params: &mut Vec<Value>) {
 }
 
 impl Database for SqliteDatabase {
-    fn list_table_names(&self) -> Result<Vec<TableName>, DatabaseError> {
+    fn namespaces_grouped(&self) -> bool {
+        false
+    }
+
+    fn list_tables(&self) -> Result<Vec<Table>, DatabaseError> {
         let mut statement = self
             .connection
             .prepare(
@@ -139,17 +143,21 @@ impl Database for SqliteDatabase {
             .map_err(DatabaseError::from_engine)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(DatabaseError::from_engine)?;
-        Ok(names.into_iter().map(TableName::new).collect())
+        Ok(names
+            .into_iter()
+            .map(|name| Table::flat(TableName::new(name)))
+            .collect())
     }
 
     fn table_page(
         &self,
-        table: &TableName,
+        table: &Table,
         filters: &[Filter],
         page: Page,
     ) -> Result<TablePage, DatabaseError> {
+        let table_name = table.name();
         let order_names = {
-            let pragma = format!("PRAGMA table_info({})", quote_ident(table.as_str()));
+            let pragma = format!("PRAGMA table_info({})", quote_ident(table_name.as_str()));
             let mut statement = self
                 .connection
                 .prepare(&pragma)
@@ -160,7 +168,7 @@ impl Database for SqliteDatabase {
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(DatabaseError::from_engine)?
         };
-        let mut sql = format!("SELECT * FROM {}", quote_ident(table.as_str()));
+        let mut sql = format!("SELECT * FROM {}", quote_ident(table_name.as_str()));
         let mut params = Vec::new();
         push_filters(filters, &mut sql, &mut params);
         if !order_names.is_empty() {
@@ -200,16 +208,16 @@ impl Database for SqliteDatabase {
         Ok(TablePage::from_fetched(columns, rows))
     }
 
-    fn table_structure(&self, table: &TableName) -> Result<TableStructure, DatabaseError> {
-        table_structure(&self.connection, table)
+    fn table_structure(&self, table: &Table) -> Result<TableStructure, DatabaseError> {
+        table_structure(&self.connection, table.name())
     }
 
     fn row_identity(
         &self,
-        table: &TableName,
+        table: &Table,
         row: &[(ColumnName, Cell)],
     ) -> Result<Option<RowIdentity>, DatabaseError> {
-        let Some(names) = identity_column_names(&self.connection, table)? else {
+        let Some(names) = identity_column_names(&self.connection, table.name())? else {
             return Ok(None);
         };
         let mut columns = Vec::with_capacity(names.len());
@@ -339,8 +347,8 @@ fn result_staging(connection: &Connection, sql: &str) -> Result<ResultStaging, D
     let Some((table, projection)) = one_table_projection(sql) else {
         return Ok(ResultStaging::ReadOnly);
     };
-    let table = TableName::new(table);
-    let Some(identity) = identity_column_names(connection, &table)? else {
+    let table = Table::flat(TableName::new(table));
+    let Some(identity) = identity_column_names(connection, table.name())? else {
         return Ok(ResultStaging::ReadOnly);
     };
     if identity_present(&identity, &projection) {
@@ -476,7 +484,7 @@ fn apply_change(connection: &Connection, change: &StagedChange) -> Result<(), Ap
             new_values,
             ..
         } => {
-            let mut sql = format!("UPDATE {} SET ", quote_ident(table.as_str()));
+            let mut sql = format!("UPDATE {} SET ", quote_ident(table.name().as_str()));
             let mut params = Vec::new();
             for (index, (column, cell)) in new_values.iter().enumerate() {
                 if index > 0 {
@@ -501,7 +509,7 @@ fn apply_change(connection: &Connection, change: &StagedChange) -> Result<(), Ap
             last_seen,
             ..
         } => {
-            let mut sql = format!("DELETE FROM {}", quote_ident(table.as_str()));
+            let mut sql = format!("DELETE FROM {}", quote_ident(table.name().as_str()));
             let mut params = Vec::new();
             push_row_predicate(&mut sql, &mut params, identity, last_seen);
             let changed = connection
@@ -515,9 +523,12 @@ fn apply_change(connection: &Connection, change: &StagedChange) -> Result<(), Ap
     }
 }
 
-fn insert_sql(table: &TableName, values: &[(ColumnName, Cell)]) -> String {
+fn insert_sql(table: &Table, values: &[(ColumnName, Cell)]) -> String {
     if values.is_empty() {
-        return format!("INSERT INTO {} DEFAULT VALUES", quote_ident(table.as_str()));
+        return format!(
+            "INSERT INTO {} DEFAULT VALUES",
+            quote_ident(table.name().as_str())
+        );
     }
     let columns = values
         .iter()
@@ -527,7 +538,7 @@ fn insert_sql(table: &TableName, values: &[(ColumnName, Cell)]) -> String {
     let placeholders = vec!["?"; values.len()].join(", ");
     format!(
         "INSERT INTO {} ({}) VALUES ({})",
-        quote_ident(table.as_str()),
+        quote_ident(table.name().as_str()),
         columns,
         placeholders
     )
