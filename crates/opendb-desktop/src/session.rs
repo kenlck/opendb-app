@@ -13,7 +13,7 @@ use opendb::{
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum DraftKind {
+enum FilterKind {
     Equals,
     Contains,
     IsNull,
@@ -52,7 +52,7 @@ struct PageGrid {
     rows: Vec<Vec<Cell>>,
     selected_row: Option<usize>,
     editing: Option<(usize, usize)>,
-    insert_draft: Option<Vec<Cell>>,
+    pending_insert: Option<Vec<Cell>>,
     edit_input: Entity<InputState>,
     editable: bool,
 }
@@ -72,21 +72,21 @@ impl PageGrid {
             rows: page.rows().to_vec(),
             selected_row: None,
             editing: None,
-            insert_draft: None,
+            pending_insert: None,
             edit_input,
             editable,
         }
     }
 
     fn row_count(&self) -> usize {
-        self.rows.len() + usize::from(self.insert_draft.is_some())
+        self.rows.len() + usize::from(self.pending_insert.is_some())
     }
 
     fn row_cells(&self, row_ix: usize) -> Option<&[Cell]> {
         if row_ix < self.rows.len() {
             self.rows.get(row_ix).map(|row| row.as_slice())
         } else {
-            self.insert_draft.as_deref()
+            self.pending_insert.as_deref()
         }
     }
 
@@ -94,7 +94,7 @@ impl PageGrid {
         if row_ix < self.rows.len() {
             self.rows.get_mut(row_ix)
         } else {
-            self.insert_draft.as_mut()
+            self.pending_insert.as_mut()
         }
     }
 
@@ -136,15 +136,15 @@ impl PageGrid {
         });
     }
 
-    fn start_insert_draft(&mut self) {
+    fn start_pending_insert(&mut self) {
         let width = self.column_names.len();
-        self.insert_draft = Some(vec![Cell::Null; width]);
+        self.pending_insert = Some(vec![Cell::Null; width]);
         self.selected_row = Some(self.rows.len());
         self.editing = None;
     }
 
     fn take_insert_values(&mut self) -> Vec<(ColumnName, Cell)> {
-        let Some(draft) = self.insert_draft.take() else {
+        let Some(draft) = self.pending_insert.take() else {
             return Vec::new();
         };
         self.column_names
@@ -221,7 +221,7 @@ pub struct SessionView {
     schema_index_name_input: Entity<InputState>,
     schema_index_columns_input: Entity<InputState>,
     schema_unique_index: bool,
-    draft_kind: DraftKind,
+    filter_kind: FilterKind,
     status: SharedString,
 }
 
@@ -284,7 +284,7 @@ impl SessionView {
             schema_index_name_input,
             schema_index_columns_input,
             schema_unique_index: false,
-            draft_kind: DraftKind::Equals,
+            filter_kind: FilterKind::Equals,
             status: SharedString::default(),
         }
     }
@@ -390,7 +390,12 @@ impl SessionView {
     }
 
     fn add_query_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let editor = cx.new(|cx| EditorState::new(window, cx).placeholder("SQL"));
+        let editor = cx.new(|cx| {
+            // gpui-component pin lacks tree-sitter-sql (conflicts with gpui's cc pin); enable that feature for real highlighting.
+            EditorState::new(window, cx)
+                .placeholder("SQL")
+                .language("sql")
+        });
         self.tabs.push(SessionTab {
             id: self.next_tab_id,
             kind: TabKind::Query {
@@ -462,15 +467,15 @@ impl SessionView {
             cx.notify();
             return;
         }
-        let filter = match self.draft_kind {
-            DraftKind::Equals => Filter::equals(
+        let filter = match self.filter_kind {
+            FilterKind::Equals => Filter::equals(
                 column,
                 Cell::Text(self.value_input.read(cx).value().to_string()),
             ),
-            DraftKind::Contains => {
+            FilterKind::Contains => {
                 Filter::contains(column, self.value_input.read(cx).value().to_string())
             }
-            DraftKind::IsNull => Filter::is_null(column),
+            FilterKind::IsNull => Filter::is_null(column),
         };
         filters.push(filter);
         if let TabKind::Table { page, .. } = &mut self.tabs[self.active_tab].kind {
@@ -739,7 +744,7 @@ impl SessionView {
             return;
         };
         grid.update(cx, |state, cx| {
-            state.delegate_mut().start_insert_draft();
+            state.delegate_mut().start_pending_insert();
             state.refresh(cx);
         });
         cx.notify();
@@ -761,7 +766,7 @@ impl SessionView {
         };
         if row_ix >= grid.read(cx).delegate().rows.len() {
             grid.update(cx, |state, cx| {
-                state.delegate_mut().insert_draft = None;
+                state.delegate_mut().pending_insert = None;
                 state.delegate_mut().selected_row = None;
                 state.refresh(cx);
             });
@@ -930,7 +935,14 @@ impl SessionView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let ddl = self.client.read(cx).schema_change_ddl(&change);
+        let ddl = match self.client.read(cx).schema_change_ddl(self.session_id, &change) {
+            Ok(ddl) => ddl,
+            Err(err) => {
+                self.status = format!("{err}").into();
+                cx.notify();
+                return;
+            }
+        };
         let session = cx.entity().downgrade();
         window.open_dialog(cx, move |dialog, _, _| {
             dialog
@@ -1267,6 +1279,7 @@ impl SessionView {
                         ),
                     );
                 }
+                let table_for_index = table.clone();
                 let mut indexes = v_flex().gap_1().child("Indexes");
                 if structure.indexes().is_empty() {
                     indexes = indexes.child("No indexes.");
@@ -1274,6 +1287,7 @@ impl SessionView {
                     for (index_ix, index) in structure.indexes().iter().enumerate() {
                         let unique = if index.unique() { "UNIQUE " } else { "" };
                         let index_name = index.name().to_string();
+                        let table_for_drop_index = table_for_index.clone();
                         indexes = indexes.child(
                             h_flex().gap_2().child(format!(
                                 "{unique}{} ({})",
@@ -1284,10 +1298,12 @@ impl SessionView {
                                     .label("Drop")
                                     .on_click(cx.listener({
                                         let index_name = index_name.clone();
+                                        let table = table_for_drop_index.clone();
                                         move |this, _, window, cx| {
                                             this.confirm_schema_change(
                                                 SchemaChange::DropIndex {
                                                     name: index_name.clone(),
+                                                    table: table.clone(),
                                                 },
                                                 window,
                                                 cx,
@@ -1343,6 +1359,7 @@ impl SessionView {
                     .child(schema_actions)
                     .child(columns)
                     .child(indexes)
+                    .child(self.render_staged_change_controls(cx))
             }
             Err(err) => v_flex().child(format!("{err}")),
         }
@@ -1424,33 +1441,33 @@ impl SessionView {
                             .child(
                                 Button::new("kind-equals")
                                     .label("Equals")
-                                    .when(self.draft_kind == DraftKind::Equals, |button| {
+                                    .when(self.filter_kind == FilterKind::Equals, |button| {
                                         button.primary()
                                     })
                                     .on_click(cx.listener(|this, _, _, cx| {
-                                        this.draft_kind = DraftKind::Equals;
+                                        this.filter_kind = FilterKind::Equals;
                                         cx.notify();
                                     })),
                             )
                             .child(
                                 Button::new("kind-contains")
                                     .label("Contains")
-                                    .when(self.draft_kind == DraftKind::Contains, |button| {
+                                    .when(self.filter_kind == FilterKind::Contains, |button| {
                                         button.primary()
                                     })
                                     .on_click(cx.listener(|this, _, _, cx| {
-                                        this.draft_kind = DraftKind::Contains;
+                                        this.filter_kind = FilterKind::Contains;
                                         cx.notify();
                                     })),
                             )
                             .child(
                                 Button::new("kind-null")
                                     .label("Null")
-                                    .when(self.draft_kind == DraftKind::IsNull, |button| {
+                                    .when(self.filter_kind == FilterKind::IsNull, |button| {
                                         button.primary()
                                     })
                                     .on_click(cx.listener(|this, _, _, cx| {
-                                        this.draft_kind = DraftKind::IsNull;
+                                        this.filter_kind = FilterKind::IsNull;
                                         cx.notify();
                                     })),
                             )
@@ -1467,6 +1484,24 @@ impl SessionView {
                     .into_any_element()
             }
         }
+    }
+
+    fn render_staged_change_controls(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        h_flex()
+            .gap_2()
+            .child(Button::new("apply").primary().label("Apply").on_click(
+                cx.listener(|this, _, window, cx| {
+                    this.apply_changes(window, cx);
+                }),
+            ))
+            .child(Button::new("discard").label("Discard").on_click(
+                cx.listener(|this, _, _, cx| {
+                    this.discard_all(cx);
+                }),
+            ))
     }
 
     fn render_grid_controls(
@@ -1550,18 +1585,16 @@ impl Render for SessionView {
         let mut tables = v_flex().gap_1().w(px(220.));
         match catalog {
             Ok(catalog) if catalog.tables().is_empty() => {
-                let namespace = if catalog.is_grouped() {
-                    Namespace::new("public")
-                } else {
-                    Namespace::main()
-                };
-                tables = tables.child("No Tables.").child(
-                    Button::new("create-table").label("Create Table").on_click(
-                        cx.listener(move |this, _, window, cx| {
-                            this.open_create_table_form(namespace.clone(), window, cx);
-                        }),
-                    ),
-                );
+                tables = tables.child("No Tables.");
+                if !catalog.is_grouped() {
+                    tables = tables.child(
+                        Button::new("create-table").label("Create Table").on_click(
+                            cx.listener(|this, _, window, cx| {
+                                this.open_create_table_form(Namespace::main(), window, cx);
+                            }),
+                        ),
+                    );
+                }
             }
             Ok(catalog) => {
                 if let Some(groups) = catalog.namespace_groups() {

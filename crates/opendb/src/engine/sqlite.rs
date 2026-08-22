@@ -5,11 +5,16 @@ use rusqlite::{Connection, OpenFlags, params_from_iter};
 use url::Url;
 
 use super::{ApplyEngineError, Database, DatabaseError};
-use crate::query::{QueryResult, ResultStaging, SqlKind, identity_present, one_table_projection};
+use crate::query::{
+    QueryResult, ResultStaging, SqlKind, identity_present, one_table_projection_sqlite,
+};
+use crate::schema_change::{SchemaChange, schema_change_ddl_sqlite};
 use crate::staged::{RowIdentity, StagedChange};
 use crate::table::{Table, TableName};
 use crate::table_page::{Cell, ColumnName, Filter, Page, TABLE_PAGE_SIZE, TablePage};
 use crate::table_structure::{StructureColumn, StructureIndex, TableStructure};
+
+use super::common::{like_contains, quote_ident, trim_sql};
 
 pub(crate) struct SqliteDatabase {
     connection: Connection,
@@ -23,14 +28,14 @@ impl SqliteDatabase {
         }
         let flags = OpenFlags::SQLITE_OPEN_READ_WRITE;
         let connection = Connection::open_with_flags(&path, flags)
-            .map_err(|error| SqliteOpenError::Driver(error.to_string()))?;
+            .map_err(|error| SqliteOpenError::Database(error.to_string()))?;
         Ok(Self { connection })
     }
 }
 
 pub(crate) enum SqliteOpenError {
     MissingFile,
-    Driver(String),
+    Database(String),
 }
 
 fn sqlite_file_path(raw: &str) -> PathBuf {
@@ -40,20 +45,6 @@ fn sqlite_file_path(raw: &str) -> PathBuf {
         }
     }
     PathBuf::from(raw)
-}
-
-fn quote_ident(name: &str) -> String {
-    let mut quoted = String::with_capacity(name.len() + 2);
-    quoted.push('"');
-    for ch in name.chars() {
-        if ch == '"' {
-            quoted.push_str("\"\"");
-        } else {
-            quoted.push(ch);
-        }
-    }
-    quoted.push('"');
-    quoted
 }
 
 fn cell_from(value: ValueRef<'_>) -> Cell {
@@ -74,21 +65,6 @@ fn value_from_cell(cell: &Cell) -> Value {
         Cell::Text(v) => Value::Text(v.clone()),
         Cell::Blob(v) => Value::Blob(v.clone()),
     }
-}
-
-fn like_contains(value: &str) -> String {
-    let mut escaped = String::from("%");
-    for ch in value.chars() {
-        match ch {
-            '%' | '_' | '\\' => {
-                escaped.push('\\');
-                escaped.push(ch);
-            }
-            other => escaped.push(other),
-        }
-    }
-    escaped.push('%');
-    escaped
 }
 
 fn push_filters(filters: &[Filter], sql: &mut String, params: &mut Vec<Value>) {
@@ -135,7 +111,7 @@ impl Database for SqliteDatabase {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT name FROM sqlite_schema WHERE type IN ('table', 'view') AND name IS NOT NULL",
+                "SELECT name FROM sqlite_schema WHERE type = 'table' AND name IS NOT NULL",
             )
             .map_err(DatabaseError::from_engine)?;
         let names = statement
@@ -272,10 +248,10 @@ impl Database for SqliteDatabase {
         tx.commit().map_err(DatabaseError::from_engine)?;
         Ok(())
     }
-}
 
-fn trim_sql(sql: &str) -> &str {
-    sql.trim().trim_end_matches(';').trim()
+    fn schema_change_ddl(&self, change: &SchemaChange) -> String {
+        schema_change_ddl_sqlite(change)
+    }
 }
 
 fn table_structure(
@@ -344,10 +320,10 @@ fn table_structure(
 }
 
 fn result_staging(connection: &Connection, sql: &str) -> Result<ResultStaging, DatabaseError> {
-    let Some((table, projection)) = one_table_projection(sql) else {
+    let Some((table_ref, projection)) = one_table_projection_sqlite(sql) else {
         return Ok(ResultStaging::ReadOnly);
     };
-    let table = Table::flat(TableName::new(table));
+    let table = Table::flat(TableName::new(table_ref.name().to_string()));
     let Some(identity) = identity_column_names(connection, table.name())? else {
         return Ok(ResultStaging::ReadOnly);
     };
@@ -361,17 +337,11 @@ fn result_staging(connection: &Connection, sql: &str) -> Result<ResultStaging, D
 fn query_page(connection: &Connection, sql: &str, page: Page) -> Result<TablePage, DatabaseError> {
     let inner = trim_sql(sql);
     let wrapped = format!("SELECT * FROM ({inner}) LIMIT ? OFFSET ?");
-    let mut params = vec![
+    let params = vec![
         Value::Integer((TABLE_PAGE_SIZE + 1) as i64),
         Value::Integer((page.index() * TABLE_PAGE_SIZE) as i64),
     ];
-    match fetch_rows(connection, &wrapped, &params) {
-        Ok(page) => Ok(page),
-        Err(_) => {
-            params.clear();
-            fetch_rows(connection, inner, &params)
-        }
-    }
+    fetch_rows(connection, &wrapped, &params)
 }
 
 fn fetch_rows(

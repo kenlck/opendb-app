@@ -15,7 +15,7 @@ use crate::engine::{
 };
 use crate::name::Name;
 use crate::query::{ExecuteError, QueryResult, SqlKind};
-use crate::schema_change::{SchemaChange, SchemaChangeError, schema_change_ddl};
+use crate::schema_change::{SchemaChange, SchemaChangeError};
 use crate::staged::{ApplyError, StageError, StagedChange, StagedChangeId};
 use crate::table::{Table, TableCatalog};
 use crate::table_page::{Cell, ColumnName, Filter, Page, TablePage};
@@ -129,7 +129,7 @@ impl Client {
                     Err(SqliteOpenError::MissingFile) => {
                         return Err(OpenError::MissingFile);
                     }
-                    Err(SqliteOpenError::Driver(message)) => {
+                    Err(SqliteOpenError::Database(message)) => {
                         return Err(OpenError::Database(message));
                     }
                 }
@@ -138,7 +138,7 @@ impl Client {
                 let opened = PostgresDatabase::open(connection.connection_string().as_str());
                 match opened {
                     Ok(database) => Box::new(database),
-                    Err(PostgresOpenError::Driver(message)) => {
+                    Err(PostgresOpenError::Database(message)) => {
                         return Err(OpenError::Database(message));
                     }
                 }
@@ -147,7 +147,7 @@ impl Client {
                 let opened = MysqlDatabase::open(connection.connection_string().as_str());
                 match opened {
                     Ok(database) => Box::new(database),
-                    Err(MysqlOpenError::Driver(message)) => {
+                    Err(MysqlOpenError::Database(message)) => {
                         return Err(OpenError::Database(message));
                     }
                 }
@@ -267,8 +267,13 @@ impl Client {
             .map_err(|error| ExecuteError::Database(error.to_string()))
     }
 
-    pub fn schema_change_ddl(&self, change: &SchemaChange) -> String {
-        schema_change_ddl(change)
+    pub fn schema_change_ddl(
+        &self,
+        id: SessionId,
+        change: &SchemaChange,
+    ) -> Result<String, CatalogError> {
+        let session = self.session(id)?;
+        Ok(session.database.schema_change_ddl(change))
     }
 
     pub fn execute_schema_change(
@@ -282,7 +287,7 @@ impl Client {
         if !session.staged.is_empty() {
             return Err(SchemaChangeError::StagedChangesExist);
         }
-        let ddl = schema_change_ddl(change);
+        let ddl = session.database.schema_change_ddl(change);
         session
             .database
             .execute_sql(&ddl)
@@ -406,9 +411,9 @@ mod tests {
     use super::*;
     use crate::connection_string::ConnectionString;
     use crate::query::{ExecuteError, ResultStaging, SqlKind};
-    use crate::schema_change::{ColumnDefinition, Namespace, SchemaChange, SchemaChangeError};
+    use crate::schema_change::{ColumnDefinition, SchemaChange, SchemaChangeError};
     use crate::staged::{ApplyError, StageError, StagedChange};
-    use crate::table::{Table, TableName};
+    use crate::table::{Namespace, Table, TableName};
     use crate::table_page::{Cell, ColumnName, Filter, Page, TablePage};
 
     fn connection_at(path: &std::path::Path) -> Connection {
@@ -451,6 +456,52 @@ mod tests {
             .map(|table| table.name().as_str())
             .collect();
         assert_eq!(names, ["users"]);
+    }
+
+    #[test]
+    fn views_are_not_listed_in_table_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("shop.db");
+        let connection = rusqlite::Connection::open(&db_path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);
+                 INSERT INTO users (name) VALUES ('ken');
+                 CREATE VIEW user_names AS SELECT name FROM users;",
+            )
+            .unwrap();
+        drop(connection);
+        let mut client = Client::open(dir.path().join("preferences.json")).unwrap();
+        let id = client.open_session(&connection_at(&db_path)).unwrap();
+        let catalog = client.tables(id).unwrap();
+        let names: Vec<_> = catalog
+            .tables()
+            .iter()
+            .map(|table| table.name().as_str())
+            .collect();
+        assert_eq!(names, ["users"]);
+    }
+
+    #[test]
+    fn query_errors_when_paging_wrapper_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("shop.db");
+        let connection = rusqlite::Connection::open(&db_path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);
+                 INSERT INTO users (name) VALUES ('ken');",
+            )
+            .unwrap();
+        drop(connection);
+        let mut client = Client::open(dir.path().join("preferences.json")).unwrap();
+        let id = client.open_session(&connection_at(&db_path)).unwrap();
+        let result = client.query(
+            id,
+            "SELECT * FROM users ORDER BY id LIMIT ?",
+            Page::first(),
+        );
+        assert!(matches!(result, Err(ExecuteError::Database(_))));
     }
 
     #[test]
@@ -1571,6 +1622,7 @@ mod tests {
                 id,
                 &SchemaChange::DropIndex {
                     name: "users_mail_idx".into(),
+                    table: users(),
                 },
             )
             .unwrap();

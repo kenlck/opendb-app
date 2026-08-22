@@ -3,7 +3,10 @@ mod mysql;
 mod postgres;
 mod sqlite;
 
+pub(crate) use common::quote_ident;
+
 use crate::query::{QueryResult, SqlKind};
+use crate::schema_change::SchemaChange;
 use crate::staged::{RowIdentity, StagedChange};
 use crate::table::Table;
 use crate::table_page::{Cell, ColumnName, Filter, Page, TablePage};
@@ -32,6 +35,7 @@ pub(crate) trait Database {
     fn sql_kind(&self, sql: &str) -> Result<SqlKind, DatabaseError>;
     fn query(&self, sql: &str, page: Page) -> Result<QueryResult, DatabaseError>;
     fn execute_sql(&self, sql: &str) -> Result<(), DatabaseError>;
+    fn schema_change_ddl(&self, change: &SchemaChange) -> String;
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]

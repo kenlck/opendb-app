@@ -66,14 +66,45 @@ pub enum ExecuteError {
     Database(String),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TableReference {
+    namespace: Option<String>,
+    name: String,
+}
+
+impl TableReference {
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub(crate) fn namespace(&self) -> Option<&str> {
+        self.namespace.as_deref()
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Projection {
     All,
     Columns(Vec<String>),
 }
 
-pub(crate) fn one_table_projection(sql: &str) -> Option<(String, Projection)> {
-    projection_from_sql(&SQLiteDialect {}, sql)
+pub(crate) fn one_table_projection_sqlite(sql: &str) -> Option<(TableReference, Projection)> {
+    one_table_projection(&SQLiteDialect {}, sql)
+}
+
+pub(crate) fn one_table_projection_postgres(sql: &str) -> Option<(TableReference, Projection)> {
+    one_table_projection(&PostgreSqlDialect {}, sql)
+}
+
+pub(crate) fn one_table_projection_mysql(sql: &str) -> Option<(TableReference, Projection)> {
+    one_table_projection(&MySqlDialect {}, sql)
+}
+
+fn one_table_projection(
+    dialect: &dyn sqlparser::dialect::Dialect,
+    sql: &str,
+) -> Option<(TableReference, Projection)> {
+    projection_from_sql(dialect, sql)
 }
 
 pub(crate) fn sql_kind_postgres(sql: &str) -> Result<SqlKind, crate::engine::DatabaseError> {
@@ -102,7 +133,10 @@ pub(crate) fn sql_kind_from_dialect(
     Ok(SqlKind::Read)
 }
 
-fn projection_from_sql(dialect: &dyn sqlparser::dialect::Dialect, sql: &str) -> Option<(String, Projection)> {
+fn projection_from_sql(
+    dialect: &dyn sqlparser::dialect::Dialect,
+    sql: &str,
+) -> Option<(TableReference, Projection)> {
     let statements = Parser::parse_sql(dialect, sql).ok()?;
     if statements.len() != 1 {
         return None;
@@ -113,7 +147,7 @@ fn projection_from_sql(dialect: &dyn sqlparser::dialect::Dialect, sql: &str) -> 
     projection_from_query(query)
 }
 
-fn projection_from_query(query: &Query) -> Option<(String, Projection)> {
+fn projection_from_query(query: &Query) -> Option<(TableReference, Projection)> {
     if query.with.is_some() || !query.pipe_operators.is_empty() {
         return None;
     }
@@ -123,7 +157,7 @@ fn projection_from_query(query: &Query) -> Option<(String, Projection)> {
     projection_from_select(select)
 }
 
-fn projection_from_select(select: &Select) -> Option<(String, Projection)> {
+fn projection_from_select(select: &Select) -> Option<(TableReference, Projection)> {
     if select.from.len() != 1 {
         return None;
     }
@@ -154,7 +188,8 @@ fn projection_from_select(select: &Select) -> Option<(String, Projection)> {
     {
         return None;
     }
-    let table = object_name_last(name)?.to_string();
+    let table_ref = object_name_reference(name)?;
+    let table = table_ref.name.clone();
     let alias = alias.as_ref().map(|alias| alias.name.value.as_str());
     let mut columns = Vec::new();
     let mut all = false;
@@ -192,9 +227,9 @@ fn projection_from_select(select: &Select) -> Option<(String, Projection)> {
         }
     }
     if all {
-        Some((table, Projection::All))
+        Some((table_ref, Projection::All))
     } else {
-        Some((table, Projection::Columns(columns)))
+        Some((table_ref, Projection::Columns(columns)))
     }
 }
 
@@ -254,6 +289,29 @@ fn object_name_last(name: &ObjectName) -> Option<&str> {
     name.0.last()?.as_ident().map(|ident| ident.value.as_str())
 }
 
+fn object_name_reference(name: &ObjectName) -> Option<TableReference> {
+    let parts: Vec<&str> = name
+        .0
+        .iter()
+        .filter_map(|part| part.as_ident().map(|ident| ident.value.as_str()))
+        .collect();
+    match parts.as_slice() {
+        [table] => Some(TableReference {
+            namespace: None,
+            name: table.to_string(),
+        }),
+        [namespace, table] => Some(TableReference {
+            namespace: Some(namespace.to_string()),
+            name: table.to_string(),
+        }),
+        [_, namespace, table] => Some(TableReference {
+            namespace: Some(namespace.to_string()),
+            name: table.to_string(),
+        }),
+        _ => None,
+    }
+}
+
 fn same_name(left: &str, right: &str) -> bool {
     left.eq_ignore_ascii_case(right)
 }
@@ -264,5 +322,35 @@ pub(crate) fn identity_present(identity: &[String], projection: &Projection) -> 
         Projection::Columns(columns) => identity
             .iter()
             .all(|column| columns.iter().any(|projected| same_name(projected, column))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn postgres_projection_keeps_namespace() {
+        let (table_ref, projection) =
+            one_table_projection_postgres("SELECT id, name FROM auth.users").unwrap();
+        assert_eq!(table_ref.namespace(), Some("auth"));
+        assert_eq!(table_ref.name(), "users");
+        assert_eq!(projection, Projection::Columns(vec!["id".into(), "name".into()]));
+    }
+
+    #[test]
+    fn postgres_projection_without_namespace_uses_bare_name() {
+        let (table_ref, _) =
+            one_table_projection_postgres("SELECT * FROM users").unwrap();
+        assert_eq!(table_ref.namespace(), None);
+        assert_eq!(table_ref.name(), "users");
+    }
+
+    #[test]
+    fn sqlite_projection_ignores_sqlite_main_namespace() {
+        let (table_ref, _) =
+            one_table_projection_sqlite("SELECT * FROM main.users").unwrap();
+        assert_eq!(table_ref.namespace(), Some("main"));
+        assert_eq!(table_ref.name(), "users");
     }
 }

@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::schema_change::Namespace;
-use crate::table::{NamespaceGroup, Table, TableCatalog};
+use crate::table::{Namespace, NamespaceGroup, Table, TableCatalog};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SystemCatalogPreference {

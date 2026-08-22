@@ -5,10 +5,13 @@ use postgres::{Client, NoTls, Row, Transaction};
 
 use super::common::{like_contains, quote_ident, trim_sql};
 use super::{ApplyEngineError, Database, DatabaseError};
-use crate::query::{QueryResult, ResultStaging, SqlKind, identity_present, one_table_projection};
-use crate::schema_change::Namespace;
+use crate::query::{
+    QueryResult, ResultStaging, SqlKind, TableReference, identity_present,
+    one_table_projection_postgres,
+};
+use crate::schema_change::{SchemaChange, schema_change_ddl_postgres};
 use crate::staged::{RowIdentity, StagedChange};
-use crate::table::{Table, TableName};
+use crate::table::{Namespace, Table, TableName};
 use crate::table_page::{Cell, ColumnName, Filter, Page, TABLE_PAGE_SIZE, TablePage};
 use crate::table_structure::{StructureColumn, StructureIndex, TableStructure};
 
@@ -17,13 +20,13 @@ pub(crate) struct PostgresDatabase {
 }
 
 pub(crate) enum PostgresOpenError {
-    Driver(String),
+    Database(String),
 }
 
 impl PostgresDatabase {
     pub(crate) fn open(connection_string: &str) -> Result<Self, PostgresOpenError> {
         let client = Client::connect(connection_string, NoTls)
-            .map_err(|error| PostgresOpenError::Driver(error.to_string()))?;
+            .map_err(|error| PostgresOpenError::Database(error.to_string()))?;
         Ok(Self {
             client: Mutex::new(client),
         })
@@ -218,7 +221,7 @@ impl Database for PostgresDatabase {
             .query(
                 "SELECT table_schema, table_name
                  FROM information_schema.tables
-                 WHERE table_type IN ('BASE TABLE', 'VIEW')
+                 WHERE table_type = 'BASE TABLE'
                  ORDER BY table_schema, table_name",
                 &[],
             )
@@ -335,6 +338,10 @@ impl Database for PostgresDatabase {
         tx.commit().map_err(DatabaseError::from_engine)?;
         Ok(())
     }
+
+    fn schema_change_ddl(&self, change: &SchemaChange) -> String {
+        schema_change_ddl_postgres(change)
+    }
 }
 
 fn table_structure(client: &mut Client, table: &Table) -> Result<TableStructure, DatabaseError> {
@@ -441,10 +448,10 @@ fn index_columns_from_definition(definition: &str) -> Vec<String> {
 }
 
 fn result_staging(client: &mut Client, sql: &str) -> Result<ResultStaging, DatabaseError> {
-    let Some((table_name, projection)) = one_table_projection(sql) else {
+    let Some((table_ref, projection)) = one_table_projection_postgres(sql) else {
         return Ok(ResultStaging::ReadOnly);
     };
-    let table = resolve_table(client, &table_name)?;
+    let table = resolve_table(client, &table_ref)?;
     let Some(identity) = identity_column_names(client, &table)? else {
         return Ok(ResultStaging::ReadOnly);
     };
@@ -455,26 +462,49 @@ fn result_staging(client: &mut Client, sql: &str) -> Result<ResultStaging, Datab
     }
 }
 
-fn resolve_table(client: &mut Client, bare_name: &str) -> Result<Table, DatabaseError> {
+fn resolve_table(client: &mut Client, reference: &TableReference) -> Result<Table, DatabaseError> {
+    if let Some(namespace) = reference.namespace() {
+        let rows = client
+            .query(
+                "SELECT 1
+                 FROM information_schema.tables
+                 WHERE table_type = 'BASE TABLE'
+                   AND table_schema = $1
+                   AND table_name = $2",
+                &[&namespace, &reference.name()],
+            )
+            .map_err(DatabaseError::from_engine)?;
+        if rows.is_empty() {
+            return Err(DatabaseError::from_engine(format!(
+                "table not found: {namespace}.{}",
+                reference.name()
+            )));
+        }
+        return Ok(Table::in_namespace(
+            Namespace::new(namespace.to_string()),
+            TableName::new(reference.name().to_string()),
+        ));
+    }
     let rows = client
         .query(
             "SELECT table_schema
              FROM information_schema.tables
-             WHERE table_type IN ('BASE TABLE', 'VIEW')
+             WHERE table_type = 'BASE TABLE'
                AND table_name = $1
              ORDER BY CASE WHEN table_schema = 'public' THEN 0 ELSE 1 END, table_schema",
-            &[&bare_name],
+            &[&reference.name()],
         )
         .map_err(DatabaseError::from_engine)?;
     let Some(row) = rows.first() else {
         return Err(DatabaseError::from_engine(format!(
-            "table not found: {bare_name}"
+            "table not found: {}",
+            reference.name()
         )));
     };
     let namespace = Namespace::new(row.get::<_, String>("table_schema"));
     Ok(Table::in_namespace(
         namespace,
-        TableName::new(bare_name.to_string()),
+        TableName::new(reference.name().to_string()),
     ))
 }
 
@@ -483,14 +513,11 @@ fn query_page(client: &mut Client, sql: &str, page: Page) -> Result<TablePage, D
     let wrapped = format!("SELECT * FROM ({inner}) AS q LIMIT $1 OFFSET $2");
     let limit = (TABLE_PAGE_SIZE + 1) as i64;
     let offset = (page.index() * TABLE_PAGE_SIZE) as i64;
-    match fetch_rows(
+    fetch_rows(
         client,
         &wrapped,
         &[SqlParam::Integer(limit), SqlParam::Integer(offset)],
-    ) {
-        Ok(page) => Ok(page),
-        Err(_) => fetch_rows(client, inner, &[]),
-    }
+    )
 }
 
 fn identity_column_names(

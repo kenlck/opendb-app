@@ -1,4 +1,5 @@
-use crate::schema_change::Namespace;
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Namespace(String);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Table {
@@ -18,6 +19,20 @@ pub struct TableName(String);
 pub struct TableCatalog {
     groups: Option<Vec<NamespaceGroup>>,
     tables: Vec<Table>,
+}
+
+impl Namespace {
+    pub fn main() -> Self {
+        Self("main".into())
+    }
+
+    pub fn new(name: impl Into<String>) -> Self {
+        Self(name.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 impl Table {

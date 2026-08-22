@@ -1,8 +1,6 @@
-use crate::table::{Table, TableName};
+use crate::engine::quote_ident;
+use crate::table::{Namespace, Table, TableName};
 use crate::table_page::ColumnName;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Namespace(String);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ColumnDefinition {
@@ -41,6 +39,7 @@ pub enum SchemaChange {
     },
     DropIndex {
         name: String,
+        table: Table,
     },
 }
 
@@ -52,20 +51,6 @@ pub enum SchemaChangeError {
     StagedChangesExist,
     #[error("{0}")]
     Database(String),
-}
-
-impl Namespace {
-    pub fn main() -> Self {
-        Self("main".into())
-    }
-
-    pub fn new(name: impl Into<String>) -> Self {
-        Self(name.into())
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
 }
 
 impl ColumnDefinition {
@@ -85,20 +70,42 @@ impl ColumnDefinition {
     }
 }
 
-pub fn schema_change_ddl(change: &SchemaChange) -> String {
+pub(crate) fn schema_change_ddl_sqlite(change: &SchemaChange) -> String {
+    schema_change_ddl_quoted(change, quote_ident)
+}
+
+pub(crate) fn schema_change_ddl_postgres(change: &SchemaChange) -> String {
+    schema_change_ddl_quoted(change, quote_ident)
+}
+
+pub(crate) fn schema_change_ddl_mysql(change: &SchemaChange) -> String {
+    match change {
+        SchemaChange::DropIndex { name, table } => format!(
+            "DROP INDEX {} ON {}",
+            mysql_quote_ident(name),
+            qualified_table(table, mysql_quote_ident)
+        ),
+        _ => schema_change_ddl_quoted(change, mysql_quote_ident),
+    }
+}
+
+fn schema_change_ddl_quoted(
+    change: &SchemaChange,
+    quote: fn(&str) -> String,
+) -> String {
     match change {
         SchemaChange::CreateTable {
             namespace,
             table,
             columns,
         } => {
-            let table_sql = qualified_table_for_create(namespace, table);
+            let table_sql = qualified_table_for_create(namespace, table, quote);
             let column_sql = columns
                 .iter()
                 .map(|column| {
                     format!(
                         "{} {}",
-                        quote_ident(column.name().as_str()),
+                        quote(column.name().as_str()),
                         column.type_sql()
                     )
                 })
@@ -107,24 +114,24 @@ pub fn schema_change_ddl(change: &SchemaChange) -> String {
             format!("CREATE TABLE {table_sql} ({column_sql})")
         }
         SchemaChange::DropTable { table } => {
-            format!("DROP TABLE {}", qualified_table(table))
+            format!("DROP TABLE {}", qualified_table(table, quote))
         }
         SchemaChange::AddColumn { table, column } => format!(
             "ALTER TABLE {} ADD COLUMN {} {}",
-            qualified_table(table),
-            quote_ident(column.name().as_str()),
+            qualified_table(table, quote),
+            quote(column.name().as_str()),
             column.type_sql()
         ),
         SchemaChange::DropColumn { table, column } => format!(
             "ALTER TABLE {} DROP COLUMN {}",
-            qualified_table(table),
-            quote_ident(column.as_str())
+            qualified_table(table, quote),
+            quote(column.as_str())
         ),
         SchemaChange::RenameColumn { table, from, to } => format!(
             "ALTER TABLE {} RENAME COLUMN {} TO {}",
-            qualified_table(table),
-            quote_ident(from.as_str()),
-            quote_ident(to.as_str())
+            qualified_table(table, quote),
+            quote(from.as_str()),
+            quote(to.as_str())
         ),
         SchemaChange::AddIndex {
             name,
@@ -135,50 +142,56 @@ pub fn schema_change_ddl(change: &SchemaChange) -> String {
             let unique = if *unique { "UNIQUE " } else { "" };
             let column_sql = columns
                 .iter()
-                .map(|column| quote_ident(column.as_str()))
+                .map(|column| quote(column.as_str()))
                 .collect::<Vec<_>>()
                 .join(", ");
             format!(
                 "CREATE {unique}INDEX {} ON {} ({column_sql})",
-                quote_ident(name),
-                qualified_table(table)
+                quote(name),
+                qualified_table(table, quote)
             )
         }
-        SchemaChange::DropIndex { name } => format!("DROP INDEX {}", quote_ident(name)),
+        SchemaChange::DropIndex { name, table: _ } => {
+            format!("DROP INDEX {}", quote(name))
+        }
     }
 }
 
-fn qualified_table_for_create(namespace: &Namespace, table: &TableName) -> String {
-    if namespace.as_str() == "main" {
-        quote_ident(table.as_str())
-    } else {
-        format!(
-            "{}.{}",
-            quote_ident(namespace.as_str()),
-            quote_ident(table.as_str())
-        )
-    }
-}
-
-fn qualified_table(table: &Table) -> String {
-    match table.namespace() {
-        None => quote_ident(table.name().as_str()),
-        Some(namespace) => qualified_table_for_create(namespace, table.name()),
-    }
-}
-
-fn quote_ident(name: &str) -> String {
+fn mysql_quote_ident(name: &str) -> String {
     let mut quoted = String::with_capacity(name.len() + 2);
-    quoted.push('"');
+    quoted.push('`');
     for ch in name.chars() {
-        if ch == '"' {
-            quoted.push_str("\"\"");
+        if ch == '`' {
+            quoted.push_str("``");
         } else {
             quoted.push(ch);
         }
     }
-    quoted.push('"');
+    quoted.push('`');
     quoted
+}
+
+fn qualified_table_for_create(
+    namespace: &Namespace,
+    table: &TableName,
+    quote: fn(&str) -> String,
+) -> String {
+    if namespace.as_str() == "main" {
+        quote(table.as_str())
+    } else {
+        format!(
+            "{}.{}",
+            quote(namespace.as_str()),
+            quote(table.as_str())
+        )
+    }
+}
+
+fn qualified_table(table: &Table, quote: fn(&str) -> String) -> String {
+    match table.namespace() {
+        None => quote(table.name().as_str()),
+        Some(namespace) => qualified_table_for_create(namespace, table.name(), quote),
+    }
 }
 
 #[cfg(test)]
@@ -195,7 +208,7 @@ mod tests {
 
     #[test]
     fn create_table_ddl_uses_main_namespace_on_sqlite() {
-        let ddl = schema_change_ddl(&SchemaChange::CreateTable {
+        let ddl = schema_change_ddl_sqlite(&SchemaChange::CreateTable {
             namespace: Namespace::main(),
             table: orders_name(),
             columns: vec![
@@ -211,8 +224,8 @@ mod tests {
 
     #[test]
     fn create_table_ddl_qualifies_non_main_namespace() {
-        let ddl = schema_change_ddl(&SchemaChange::CreateTable {
-            namespace: Namespace("public".into()),
+        let ddl = schema_change_ddl_sqlite(&SchemaChange::CreateTable {
+            namespace: Namespace::new("public"),
             table: orders_name(),
             columns: vec![ColumnDefinition::new("id", "INTEGER PRIMARY KEY")],
         });
@@ -225,25 +238,25 @@ mod tests {
     #[test]
     fn drop_table_add_drop_rename_column_and_index_ddl() {
         assert_eq!(
-            schema_change_ddl(&SchemaChange::DropTable { table: orders() }),
+            schema_change_ddl_sqlite(&SchemaChange::DropTable { table: orders() }),
             "DROP TABLE \"orders\""
         );
         assert_eq!(
-            schema_change_ddl(&SchemaChange::AddColumn {
+            schema_change_ddl_sqlite(&SchemaChange::AddColumn {
                 table: orders(),
                 column: ColumnDefinition::new("status", "TEXT"),
             }),
             "ALTER TABLE \"orders\" ADD COLUMN \"status\" TEXT"
         );
         assert_eq!(
-            schema_change_ddl(&SchemaChange::DropColumn {
+            schema_change_ddl_sqlite(&SchemaChange::DropColumn {
                 table: orders(),
                 column: ColumnName::new("status".into()),
             }),
             "ALTER TABLE \"orders\" DROP COLUMN \"status\""
         );
         assert_eq!(
-            schema_change_ddl(&SchemaChange::RenameColumn {
+            schema_change_ddl_sqlite(&SchemaChange::RenameColumn {
                 table: orders(),
                 from: ColumnName::new("status".into()),
                 to: ColumnName::new("state".into()),
@@ -251,7 +264,7 @@ mod tests {
             "ALTER TABLE \"orders\" RENAME COLUMN \"status\" TO \"state\""
         );
         assert_eq!(
-            schema_change_ddl(&SchemaChange::AddIndex {
+            schema_change_ddl_sqlite(&SchemaChange::AddIndex {
                 name: "orders_status_idx".into(),
                 table: orders(),
                 columns: vec![ColumnName::new("status".into())],
@@ -260,7 +273,7 @@ mod tests {
             "CREATE INDEX \"orders_status_idx\" ON \"orders\" (\"status\")"
         );
         assert_eq!(
-            schema_change_ddl(&SchemaChange::AddIndex {
+            schema_change_ddl_sqlite(&SchemaChange::AddIndex {
                 name: "orders_status_uidx".into(),
                 table: orders(),
                 columns: vec![
@@ -272,10 +285,22 @@ mod tests {
             "CREATE UNIQUE INDEX \"orders_status_uidx\" ON \"orders\" (\"status\", \"id\")"
         );
         assert_eq!(
-            schema_change_ddl(&SchemaChange::DropIndex {
+            schema_change_ddl_sqlite(&SchemaChange::DropIndex {
                 name: "orders_status_idx".into(),
+                table: orders(),
             }),
             "DROP INDEX \"orders_status_idx\""
+        );
+    }
+
+    #[test]
+    fn mysql_drop_index_includes_table() {
+        assert_eq!(
+            schema_change_ddl_mysql(&SchemaChange::DropIndex {
+                name: "orders_status_idx".into(),
+                table: orders(),
+            }),
+            "DROP INDEX `orders_status_idx` ON `orders`"
         );
     }
 }

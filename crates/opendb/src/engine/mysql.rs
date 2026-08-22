@@ -5,7 +5,10 @@ use mysql::{Conn, Opts, Params, TxOpts, Value};
 
 use super::common::{like_contains, quote_ident, trim_sql};
 use super::{ApplyEngineError, Database, DatabaseError};
-use crate::query::{QueryResult, ResultStaging, SqlKind, identity_present, one_table_projection};
+use crate::query::{
+    QueryResult, ResultStaging, SqlKind, identity_present, one_table_projection_mysql,
+};
+use crate::schema_change::{SchemaChange, schema_change_ddl_mysql};
 use crate::staged::{RowIdentity, StagedChange};
 use crate::table::{Table, TableName};
 use crate::table_page::{Cell, ColumnName, Filter, Page, TABLE_PAGE_SIZE, TablePage};
@@ -16,17 +19,17 @@ pub(crate) struct MysqlDatabase {
 }
 
 pub(crate) enum MysqlOpenError {
-    Driver(String),
+    Database(String),
 }
 
 impl MysqlDatabase {
     pub(crate) fn open(connection_string: &str) -> Result<Self, MysqlOpenError> {
         let url = mysql_url(connection_string);
-        let opts = Opts::from_url(&url).map_err(|error| MysqlOpenError::Driver(error.to_string()))?;
+        let opts = Opts::from_url(&url).map_err(|error| MysqlOpenError::Database(error.to_string()))?;
         let mut conn =
-            Conn::new(opts).map_err(|error| MysqlOpenError::Driver(error.to_string()))?;
+            Conn::new(opts).map_err(|error| MysqlOpenError::Database(error.to_string()))?;
         conn.query_drop("SET SESSION sql_mode = CONCAT(@@SESSION.sql_mode, ',ANSI_QUOTES')")
-            .map_err(|error| MysqlOpenError::Driver(error.to_string()))?;
+            .map_err(|error| MysqlOpenError::Database(error.to_string()))?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -165,7 +168,7 @@ impl Database for MysqlDatabase {
                 "SELECT table_name
                  FROM information_schema.tables
                  WHERE table_schema = DATABASE()
-                   AND table_type IN ('BASE TABLE', 'VIEW')
+                   AND table_type = 'BASE TABLE'
                  ORDER BY table_name",
             )
             .map_err(DatabaseError::from_engine)?;
@@ -261,8 +264,16 @@ impl Database for MysqlDatabase {
 
     fn execute_sql(&self, sql: &str) -> Result<(), DatabaseError> {
         let mut conn = self.lock();
-        conn.query_drop(sql).map_err(DatabaseError::from_engine)?;
+        let mut tx = conn
+            .start_transaction(TxOpts::default())
+            .map_err(DatabaseError::from_engine)?;
+        tx.query_drop(sql).map_err(DatabaseError::from_engine)?;
+        tx.commit().map_err(DatabaseError::from_engine)?;
         Ok(())
+    }
+
+    fn schema_change_ddl(&self, change: &SchemaChange) -> String {
+        schema_change_ddl_mysql(change)
     }
 }
 
@@ -312,10 +323,10 @@ fn table_structure(conn: &mut Conn, table: &Table) -> Result<TableStructure, Dat
 }
 
 fn result_staging(conn: &mut Conn, sql: &str) -> Result<ResultStaging, DatabaseError> {
-    let Some((table_name, projection)) = one_table_projection(sql) else {
+    let Some((table_ref, projection)) = one_table_projection_mysql(sql) else {
         return Ok(ResultStaging::ReadOnly);
     };
-    let table = Table::flat(TableName::new(table_name));
+    let table = Table::flat(TableName::new(table_ref.name().to_string()));
     let Some(identity) = identity_column_names(conn, &table)? else {
         return Ok(ResultStaging::ReadOnly);
     };
@@ -331,10 +342,7 @@ fn query_page(conn: &mut Conn, sql: &str, page: Page) -> Result<TablePage, Datab
     let wrapped = format!("SELECT * FROM ({inner}) AS q LIMIT ? OFFSET ?");
     let limit = Value::Int((TABLE_PAGE_SIZE + 1) as i64);
     let offset = Value::Int((page.index() * TABLE_PAGE_SIZE) as i64);
-    match fetch_rows(conn, &wrapped, vec![limit.clone(), offset]) {
-        Ok(page) => Ok(page),
-        Err(_) => fetch_rows(conn, inner, Vec::new()),
-    }
+    fetch_rows(conn, &wrapped, vec![limit, offset])
 }
 
 fn identity_column_names(
