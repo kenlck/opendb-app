@@ -17,6 +17,8 @@ use opendb::{
     staged_inspector_shows_actions, staged_inspector_width_px, tables_in_namespace,
 };
 
+use crate::window_chrome::window_drag_strip;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FilterKind {
     Equals,
@@ -2325,13 +2327,19 @@ impl Render for SessionView {
             )
             .child(self.render_active_tab(window, cx));
 
-        h_flex()
+        v_flex()
             .size_full()
             .bg(cx.theme().background)
             .text_color(foreground)
-            .child(sidebar)
-            .child(center)
-            .child(staged_pane)
+            .child(window_drag_strip(cx))
+            .child(
+                h_flex()
+                    .size_full()
+                    .min_h_0()
+                    .child(sidebar)
+                    .child(center)
+                    .child(staged_pane),
+            )
     }
 }
 

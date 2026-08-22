@@ -18,9 +18,11 @@ pub use catalog::SystemCatalogPreference;
 // Namespace picker helpers for Session chrome (TablePlus-style schema control).
 pub use catalog::{default_namespace, tables_in_namespace};
 pub use chrome_layout::{
-    GRID_ROW_HEIGHT_PX, GRID_STRIPE, TAB_BAR_HEIGHT_PX, column_width_px, filter_chips_own_row,
-    grid_emits_phantom_rows, namespace_footer_is_single_control, session_window_title,
-    staged_inspector_shows_actions, staged_inspector_width_px,
+    ClientWindowChromePolicy, GRID_ROW_HEIGHT_PX, GRID_STRIPE, TAB_BAR_HEIGHT_PX,
+    WINDOW_DRAG_STRIP_HEIGHT_PX, client_window_chrome_policy, column_width_px,
+    connection_list_window_title, filter_chips_own_row, grid_emits_phantom_rows,
+    namespace_footer_is_single_control, session_window_title, staged_inspector_shows_actions,
+    staged_inspector_width_px,
 };
 pub use client::{CatalogError, Client, CloseResult, OpenError, PreferenceError, SessionId};
 pub use connection::Connection;
