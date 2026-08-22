@@ -74,6 +74,14 @@ impl Page {
     pub const fn next(self) -> Self {
         Self(self.0 + 1)
     }
+
+    pub const fn prev(self) -> Option<Self> {
+        if self.0 == 0 {
+            None
+        } else {
+            Some(Self(self.0 - 1))
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]

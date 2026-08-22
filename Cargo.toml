@@ -25,6 +25,9 @@ gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "e0931d5a
 gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "7acfc184382d30864a688fdaa6c9ff719efc53ae" }
 gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "7acfc184382d30864a688fdaa6c9ff719efc53ae" }
 
+# Pin every gpui consumer to the same Zed rev. Use https://git@… so the
+# patch source differs from the dependency URL (Cargo forbids same-source
+# patches) while staying publicly fetchable on GitHub Actions (no SSH key).
 [patch."https://github.com/zed-industries/zed"]
-gpui = { git = "ssh://git@github.com/zed-industries/zed.git", rev = "e0931d5a9dbf4f781b336fdf448739e74a2ac0b5", version = "=0.2.2" }
-gpui_platform = { git = "ssh://git@github.com/zed-industries/zed.git", rev = "e0931d5a9dbf4f781b336fdf448739e74a2ac0b5", version = "=0.1.0" }
+gpui = { git = "https://git@github.com/zed-industries/zed", rev = "e0931d5a9dbf4f781b336fdf448739e74a2ac0b5", version = "=0.2.2" }
+gpui_platform = { git = "https://git@github.com/zed-industries/zed", rev = "e0931d5a9dbf4f781b336fdf448739e74a2ac0b5", version = "=0.1.0" }

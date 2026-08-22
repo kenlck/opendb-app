@@ -1,0 +1,4 @@
+# Prefer the git CLI for Cargo fetches. Harmless locally; useful when a
+# [patch] git URL needs insteadOf or other git config.
+[net]
+git-fetch-with-cli = true

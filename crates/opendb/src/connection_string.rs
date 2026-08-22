@@ -11,6 +11,26 @@ pub enum Engine {
     Mysql,
 }
 
+impl Engine {
+    /// Short badge for the Connection List (PG / SQL / MY).
+    pub fn badge(self) -> &'static str {
+        match self {
+            Self::Postgres => "PG",
+            Self::Sqlite => "SQL",
+            Self::Mysql => "MY",
+        }
+    }
+
+    /// Engine name for Session titlebars (`Postgres`, `SQLite`, `MySQL`).
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Postgres => "Postgres",
+            Self::Sqlite => "SQLite",
+            Self::Mysql => "MySQL",
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ParseError {
     #[error("connection string is empty")]
@@ -69,6 +89,36 @@ impl ConnectionString {
     pub fn default_name(&self) -> &Name {
         &self.default_name
     }
+
+    /// Host/file · Database label for the Connection List. Never includes the secret.
+    pub fn list_subtitle(&self) -> String {
+        match self.engine {
+            Engine::Sqlite => sqlite_path_label(&self.raw),
+            Engine::Postgres | Engine::Mysql => {
+                let host = Url::parse(&self.raw)
+                    .ok()
+                    .and_then(|url| {
+                        url.host_str()
+                            .map(str::to_string)
+                            .or_else(|| url.host().map(|host| host.to_string()))
+                    })
+                    .unwrap_or_else(|| "localhost".into());
+                format!("{host} · {}", self.default_name.as_str())
+            }
+        }
+    }
+}
+
+fn sqlite_path_label(raw: &str) -> String {
+    if let Ok(url) = Url::parse(raw) {
+        if url.scheme() == "sqlite" {
+            let path = url.path();
+            if !path.is_empty() && path != "/" {
+                return path.to_string();
+            }
+        }
+    }
+    raw.to_string()
 }
 
 impl fmt::Display for ConnectionString {
@@ -195,6 +245,18 @@ mod tests {
         let cs = ConnectionString::parse("/tmp/shop.db").unwrap();
         assert_eq!(cs.engine(), Engine::Sqlite);
         assert_eq!(cs.default_name().as_str(), "shop");
+        assert_eq!(cs.list_subtitle(), "/tmp/shop.db");
+        assert_eq!(Engine::Sqlite.badge(), "SQL");
+        assert_eq!(Engine::Sqlite.label(), "SQLite");
+    }
+
+    #[test]
+    fn list_subtitle_is_host_and_database_without_secret() {
+        let cs = ConnectionString::parse("postgres://ken:secret@db.internal/myapp").unwrap();
+        assert_eq!(cs.list_subtitle(), "db.internal · myapp");
+        assert!(!cs.list_subtitle().contains("secret"));
+        assert_eq!(Engine::Postgres.badge(), "PG");
+        assert_eq!(Engine::Mysql.badge(), "MY");
     }
 
     #[test]

@@ -1,15 +1,19 @@
+use std::collections::HashSet;
+
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::checkbox::Checkbox;
 use gpui_component::dialog::{DialogClose, DialogFooter};
 use gpui_component::input::{Editor, EditorState, Input, InputEvent, InputState};
+use gpui_component::menu::{ContextMenuExt, DropdownMenu, PopupMenuItem};
 use gpui_component::tab::{Tab, TabBar};
 use gpui_component::table::{Column, DataTable, TableDelegate, TableState};
 use gpui_component::{ActiveTheme, Disableable, IconName, Sizable, WindowExt, h_flex, v_flex};
 use opendb::{
-    Cell, Client, ColumnDefinition, ColumnName, Filter, Namespace, Page, ResultStaging,
-    SchemaChange, SessionId, SqlKind, StagedChange, StagedChangeId, SystemCatalogPreference,
-    Table, TableName, TablePage,
+    Cell, Client, ColumnDefinition, ColumnName, Filter, Namespace, Page, ResultStaging, RowIdentity,
+    SchemaChange, SessionId, SqlKind, StagedChange, StagedChangeId, SystemCatalogPreference, Table,
+    TableName, TablePage, TABLE_PAGE_SIZE,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -210,6 +214,8 @@ pub struct SessionView {
     tabs: Vec<SessionTab>,
     active_tab: usize,
     next_tab_id: u64,
+    table_search: Entity<InputState>,
+    collapsed_namespaces: HashSet<String>,
     column_input: Entity<InputState>,
     value_input: Entity<InputState>,
     edit_input: Entity<InputState>,
@@ -242,6 +248,8 @@ impl SessionView {
         let column_input = cx.new(|cx| InputState::new(window, cx).placeholder("Column"));
         let value_input = cx.new(|cx| InputState::new(window, cx).placeholder("Value"));
         let edit_input = cx.new(|cx| InputState::new(window, cx));
+        let table_search =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Search Tables"));
         let schema_table_input = cx.new(|cx| InputState::new(window, cx).placeholder("Table name"));
         let schema_columns_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder("id INTEGER PRIMARY KEY\nname TEXT")
@@ -261,6 +269,12 @@ impl SessionView {
             }
         })
         .detach();
+        cx.subscribe(&table_search, |_, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        })
+        .detach();
         let entity = cx.entity().downgrade();
         window.on_window_should_close(cx, move |window, cx| {
             entity
@@ -273,6 +287,8 @@ impl SessionView {
             tabs: Vec::new(),
             active_tab: 0,
             next_tab_id: 1,
+            table_search,
+            collapsed_namespaces: HashSet::new(),
             column_input,
             value_input,
             edit_input,
@@ -514,6 +530,140 @@ impl SessionView {
             TabKind::Structure { .. } => {}
         }
         self.reload(window, cx);
+    }
+
+    fn prev_page(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let page = match &self.tabs.get(self.active_tab).map(|tab| &tab.kind) {
+            Some(TabKind::Table { page, .. }) | Some(TabKind::Query { page, .. }) => *page,
+            _ => return,
+        };
+        let Some(prev) = page.prev() else {
+            return;
+        };
+        match &mut self.tabs[self.active_tab].kind {
+            TabKind::Table { page, .. } | TabKind::Query { page, .. } => {
+                *page = prev;
+            }
+            TabKind::Structure { .. } => {}
+        }
+        self.reload(window, cx);
+    }
+
+    fn open_filter_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !matches!(
+            self.tabs.get(self.active_tab).map(|tab| &tab.kind),
+            Some(TabKind::Table { .. })
+        ) {
+            self.status = "Filters apply to a Table Tab.".into();
+            cx.notify();
+            return;
+        }
+        let session = cx.entity().downgrade();
+        let column_input = self.column_input.clone();
+        let value_input = self.value_input.clone();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let kind = session
+                .upgrade()
+                .map(|entity| entity.read(cx).filter_kind)
+                .unwrap_or(FilterKind::Equals);
+            dialog
+                .title("Add Filter")
+                .child(
+                    v_flex()
+                        .gap_2()
+                        .w(px(360.))
+                        .child(Input::new(&column_input))
+                        .child(
+                            h_flex()
+                                .gap_1()
+                                .child(
+                                    Button::new("kind-equals")
+                                        .label("Equals")
+                                        .when(kind == FilterKind::Equals, |button| button.primary())
+                                        .on_click({
+                                            let session = session.clone();
+                                            move |_, _, cx| {
+                                                session
+                                                    .update(cx, |this, cx| {
+                                                        this.filter_kind = FilterKind::Equals;
+                                                        cx.notify();
+                                                    })
+                                                    .ok();
+                                            }
+                                        }),
+                                )
+                                .child(
+                                    Button::new("kind-contains")
+                                        .label("Contains")
+                                        .when(kind == FilterKind::Contains, |button| {
+                                            button.primary()
+                                        })
+                                        .on_click({
+                                            let session = session.clone();
+                                            move |_, _, cx| {
+                                                session
+                                                    .update(cx, |this, cx| {
+                                                        this.filter_kind = FilterKind::Contains;
+                                                        cx.notify();
+                                                    })
+                                                    .ok();
+                                            }
+                                        }),
+                                )
+                                .child(
+                                    Button::new("kind-null")
+                                        .label("Null")
+                                        .when(kind == FilterKind::IsNull, |button| button.primary())
+                                        .on_click({
+                                            let session = session.clone();
+                                            move |_, _, cx| {
+                                                session
+                                                    .update(cx, |this, cx| {
+                                                        this.filter_kind = FilterKind::IsNull;
+                                                        cx.notify();
+                                                    })
+                                                    .ok();
+                                            }
+                                        }),
+                                ),
+                        )
+                        .child(Input::new(&value_input)),
+                )
+                .footer(
+                    DialogFooter::new()
+                        .child(Button::new("add-filter").primary().label("Add Filter").on_click({
+                            let session = session.clone();
+                            move |_, window, cx| {
+                                session
+                                    .update(cx, |this, cx| {
+                                        this.add_filter(window, cx);
+                                        window.close_dialog(cx);
+                                    })
+                                    .ok();
+                            }
+                        }))
+                        .child(DialogClose::new().child(Button::new("cancel-filter").label("Cancel"))),
+                )
+        });
+    }
+
+    fn toggle_namespace(&mut self, namespace: &str, cx: &mut Context<Self>) {
+        if self.collapsed_namespaces.contains(namespace) {
+            self.collapsed_namespaces.remove(namespace);
+        } else {
+            self.collapsed_namespaces.insert(namespace.to_string());
+        }
+        cx.notify();
+    }
+
+    fn table_matches_search(&self, table: &Table, cx: &App) -> bool {
+        let query = self.table_search.read(cx).value().trim().to_lowercase();
+        if query.is_empty() {
+            return true;
+        }
+        let name = table.name().as_str().to_lowercase();
+        let full = table_label(table).to_lowercase();
+        name.contains(&query) || full.contains(&query)
     }
 
     fn active_table(&self) -> Option<Table> {
@@ -1359,7 +1509,6 @@ impl SessionView {
                     .child(schema_actions)
                     .child(columns)
                     .child(indexes)
-                    .child(self.render_staged_change_controls(cx))
             }
             Err(err) => v_flex().child(format!("{err}")),
         }
@@ -1373,6 +1522,8 @@ impl SessionView {
         let Some(tab) = self.tabs.get(self.active_tab) else {
             return v_flex()
                 .flex_1()
+                .p_4()
+                .text_color(cx.theme().muted_foreground)
                 .child("Pick a Table, open Structure, or start a Query.")
                 .into_any_element();
         };
@@ -1382,191 +1533,241 @@ impl SessionView {
                 .into_any_element(),
             TabKind::Query { editor, .. } => {
                 let grid = self.active_grid();
-                let has_next = match &self.tabs[self.active_tab].kind {
-                    TabKind::Query { has_next, .. } => *has_next,
-                    _ => false,
+                let (has_next, page, row_count) = match &self.tabs[self.active_tab].kind {
+                    TabKind::Query {
+                        has_next,
+                        page,
+                        grid,
+                        ..
+                    } => (
+                        *has_next,
+                        *page,
+                        grid.as_ref()
+                            .map(|state| state.read(cx).delegate().rows.len())
+                            .unwrap_or(0),
+                    ),
+                    _ => (false, Page::first(), 0),
                 };
                 let can_stage = self.active_table().is_some();
                 let grid_element = match grid {
                     Some(state) => v_flex()
                         .flex_1()
-                        .min_h(px(240.))
+                        .min_h(px(160.))
                         .child(DataTable::new(&state).stripe(true)),
-                    None => v_flex().flex_1().child("Run a Query to see Results."),
+                    None => v_flex()
+                        .flex_1()
+                        .p_3()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("Run a Query to see Results."),
                 };
                 v_flex()
                     .flex_1()
                     .gap_2()
-                    .child(Editor::new(&editor).h(px(120.)))
+                    .p_2()
+                    .child(Editor::new(&editor).h(px(140.)))
                     .child(
-                        Button::new("run-sql").primary().label("Run").on_click(
-                            cx.listener(|this, _, window, cx| this.run_sql(window, cx)),
+                        h_flex().gap_2().child(
+                            Button::new("run-sql").primary().label("Run").on_click(
+                                cx.listener(|this, _, window, cx| this.run_sql(window, cx)),
+                            ),
                         ),
                     )
                     .child(grid_element)
-                    .child(self.render_grid_controls(has_next, can_stage, window, cx))
+                    .child(self.render_pagination_bar(page, has_next, row_count, can_stage, cx))
                     .into_any_element()
             }
             TabKind::Table {
-                filters, has_next, ..
+                filters, has_next, page, grid, ..
             } => {
-                let grid = self.active_grid();
                 let can_stage = self.active_table().is_some();
-                let mut filter_rows = v_flex().gap_1();
+                let row_count = grid
+                    .as_ref()
+                    .map(|state| state.read(cx).delegate().rows.len())
+                    .unwrap_or(0);
+                let mut filter_bar = h_flex().gap_2().px_2().py_1().flex_wrap().items_center();
                 for (index, filter) in filters.iter().enumerate() {
-                    filter_rows = filter_rows.child(
-                        h_flex().gap_2().child(filter_label(filter)).child(
-                            Button::new(("remove-filter", index as u64))
-                                .label("Remove")
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.remove_filter(index, window, cx);
-                                })),
-                        ),
+                    filter_bar = filter_bar.child(
+                        h_flex()
+                            .id(("filter-chip", index as u64))
+                            .gap_1()
+                            .px_2()
+                            .py(px(2.))
+                            .rounded(px(4.))
+                            .bg(cx.theme().secondary)
+                            .border_1()
+                            .border_color(cx.theme().border)
+                            .items_center()
+                            .child(div().text_xs().child(filter_label(filter)))
+                            .child(
+                                Button::new(("remove-filter", index as u64))
+                                    .icon(IconName::Close)
+                                    .ghost()
+                                    .xsmall()
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.remove_filter(index, window, cx);
+                                    })),
+                            ),
                     );
                 }
-                let grid_element = match grid {
+                filter_bar = filter_bar.child(
+                    Button::new("add-filter")
+                        .label("+ Filter")
+                        .ghost()
+                        .xsmall()
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_filter_dialog(window, cx);
+                        })),
+                );
+                let grid_element = match self.active_grid() {
                     Some(state) => v_flex()
                         .flex_1()
-                        .min_h(px(240.))
+                        .min_h(px(160.))
                         .child(DataTable::new(&state).stripe(true)),
-                    None => v_flex().flex_1().child("Loading…"),
+                    None => v_flex()
+                        .flex_1()
+                        .p_3()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("Loading…"),
                 };
                 v_flex()
                     .flex_1()
-                    .gap_2()
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .child(Input::new(&self.column_input))
-                            .child(
-                                Button::new("kind-equals")
-                                    .label("Equals")
-                                    .when(self.filter_kind == FilterKind::Equals, |button| {
-                                        button.primary()
-                                    })
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.filter_kind = FilterKind::Equals;
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                Button::new("kind-contains")
-                                    .label("Contains")
-                                    .when(self.filter_kind == FilterKind::Contains, |button| {
-                                        button.primary()
-                                    })
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.filter_kind = FilterKind::Contains;
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                Button::new("kind-null")
-                                    .label("Null")
-                                    .when(self.filter_kind == FilterKind::IsNull, |button| {
-                                        button.primary()
-                                    })
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.filter_kind = FilterKind::IsNull;
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(Input::new(&self.value_input))
-                            .child(Button::new("add-filter").label("Add Filter").on_click(
-                                cx.listener(|this, _, window, cx| {
-                                    this.add_filter(window, cx);
-                                }),
-                            )),
-                    )
-                    .child(filter_rows)
+                    .gap_1()
+                    .child(filter_bar)
                     .child(grid_element)
-                    .child(self.render_grid_controls(has_next, can_stage, window, cx))
+                    .child(self.render_pagination_bar(page, has_next, row_count, can_stage, cx))
                     .into_any_element()
             }
         }
     }
 
-    fn render_staged_change_controls(
+    fn render_pagination_bar(
         &self,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        h_flex()
-            .gap_2()
-            .child(Button::new("apply").primary().label("Apply").on_click(
-                cx.listener(|this, _, window, cx| {
-                    this.apply_changes(window, cx);
-                }),
-            ))
-            .child(Button::new("discard").label("Discard").on_click(
-                cx.listener(|this, _, _, cx| {
-                    this.discard_all(cx);
-                }),
-            ))
-    }
-
-    fn render_grid_controls(
-        &self,
+        page: Page,
         has_next: bool,
+        row_count: usize,
         can_stage: bool,
-        _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let page_number = page.index() + 1;
+        let start = if row_count == 0 {
+            0
+        } else {
+            page.index() * TABLE_PAGE_SIZE + 1
+        };
+        let end = page.index() * TABLE_PAGE_SIZE + row_count;
+        let range_label = if row_count == 0 {
+            "No rows".to_string()
+        } else if has_next {
+            format!("{start} – {end}+")
+        } else {
+            format!("{start} – {end}")
+        };
+        let can_prev = page.index() > 0;
         h_flex()
+            .w_full()
+            .px_2()
+            .py_1()
             .gap_2()
+            .items_center()
+            .border_t_1()
+            .border_color(cx.theme().border)
+            .child(
+                Button::new("first-page")
+                    .label("«")
+                    .ghost()
+                    .xsmall()
+                    .disabled(!can_prev)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        if let Some(TabKind::Table { page, .. } | TabKind::Query { page, .. }) =
+                            this.tabs.get_mut(this.active_tab).map(|tab| &mut tab.kind)
+                        {
+                            *page = Page::first();
+                        }
+                        this.reload(window, cx);
+                    })),
+            )
+            .child(
+                Button::new("prev-page")
+                    .label("‹")
+                    .ghost()
+                    .xsmall()
+                    .disabled(!can_prev)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.prev_page(window, cx);
+                    })),
+            )
             .child(
                 Button::new("next-page")
-                    .label("Next page")
+                    .label("›")
+                    .ghost()
+                    .xsmall()
                     .disabled(!has_next)
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.next_page(window, cx);
                     })),
             )
             .child(
-                Button::new("insert-row")
-                    .label("Insert row")
-                    .disabled(!can_stage)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.start_insert_row(cx);
-                    })),
+                Button::new("page-label")
+                    .label(format!("Page {page_number}"))
+                    .ghost()
+                    .xsmall()
+                    .disabled(true),
+            )
+            .child(div().flex_1())
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(format!("{TABLE_PAGE_SIZE} rows")),
+            )
+            .child(div().flex_1())
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(range_label),
             )
             .child(
-                Button::new("stage-insert")
-                    .label("Stage insert")
-                    .disabled(!can_stage)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.stage_insert_row(cx);
-                    })),
+                {
+                    let view = cx.entity().downgrade();
+                    Button::new("grid-more")
+                        .icon(IconName::Ellipsis)
+                        .ghost()
+                        .xsmall()
+                        .disabled(!can_stage)
+                        .dropdown_menu(move |menu, _, _| {
+                            menu.item(PopupMenuItem::new("Insert row").on_click({
+                                let view = view.clone();
+                                move |_, _, cx| {
+                                    view.update(cx, |this, cx| this.start_insert_row(cx))
+                                        .ok();
+                                }
+                            }))
+                            .item(PopupMenuItem::new("Stage insert").on_click({
+                                let view = view.clone();
+                                move |_, _, cx| {
+                                    view.update(cx, |this, cx| this.stage_insert_row(cx))
+                                        .ok();
+                                }
+                            }))
+                            .item(PopupMenuItem::new("Stage delete").on_click({
+                                let view = view.clone();
+                                move |_, _, cx| {
+                                    view.update(cx, |this, cx| this.stage_delete_row(cx))
+                                        .ok();
+                                }
+                            }))
+                        })
+                },
             )
-            .child(
-                Button::new("stage-delete")
-                    .label("Stage delete")
-                    .disabled(!can_stage)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.stage_delete_row(cx);
-                    })),
-            )
-            .child(Button::new("apply").primary().label("Apply").on_click(
-                cx.listener(|this, _, window, cx| {
-                    this.apply_changes(window, cx);
-                }),
-            ))
-            .child(Button::new("discard").label("Discard").on_click(
-                cx.listener(|this, _, _, cx| {
-                    this.discard_all(cx);
-                }),
-            ))
     }
 }
 
 impl Render for SessionView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let (shown, title, catalog, staged) = {
+        let (shown, catalog, staged, staged_count) = {
             let client = self.client.read(cx);
             let shown = client.show_system_catalogs() == SystemCatalogPreference::Shown;
-            let title = client
-                .session_name(self.session_id)
-                .map(|name| name.as_str().to_string())
-                .unwrap_or_else(|_| "Session".into());
             let catalog = client
                 .tables(self.session_id)
                 .map_err(|err| format!("{err}"));
@@ -1575,86 +1776,287 @@ impl Render for SessionView {
                 .map(|changes| {
                     changes
                         .iter()
-                        .map(|change| (change.id(), change_label(change)))
+                        .map(|change| (change.id(), change_kind_icon(change), change_label(change)))
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
-            (shown, title, catalog, staged)
+            let staged_count = staged.len();
+            (shown, catalog, staged, staged_count)
         };
 
-        let mut tables = v_flex().gap_1().w(px(220.));
-        match catalog {
+        let border = cx.theme().border;
+        let muted = cx.theme().muted_foreground;
+        let secondary = cx.theme().secondary;
+        let foreground = cx.theme().foreground;
+
+        let mut tree = v_flex().id("table-tree").flex_1().w_full().gap_0().overflow_y_scroll();
+        match &catalog {
             Ok(catalog) if catalog.tables().is_empty() => {
-                tables = tables.child("No Tables.");
-                if !catalog.is_grouped() {
-                    tables = tables.child(
-                        Button::new("create-table").label("Create Table").on_click(
-                            cx.listener(|this, _, window, cx| {
-                                this.open_create_table_form(Namespace::main(), window, cx);
-                            }),
-                        ),
-                    );
-                }
+                tree = tree.child(
+                    div()
+                        .p_3()
+                        .text_color(muted)
+                        .child("No Tables."),
+                );
             }
             Ok(catalog) => {
                 if let Some(groups) = catalog.namespace_groups() {
                     for (group_index, group) in groups.iter().enumerate() {
                         let namespace = group.namespace().clone();
-                        tables = tables.child(
-                            h_flex().gap_1().child(namespace.as_str().to_string()).child(
-                                Button::new(("create-in-namespace", group_index as u64))
-                                    .label("Create Table")
-                                    .on_click(cx.listener({
-                                        let namespace = namespace.clone();
-                                        move |this, _, window, cx| {
-                                            this.open_create_table_form(
-                                                namespace.clone(),
-                                                window,
-                                                cx,
-                                            );
-                                        }
-                                    })),
-                            ),
+                        let ns_key = namespace.as_str().to_string();
+                        let collapsed = self.collapsed_namespaces.contains(&ns_key);
+                        let visible_tables: Vec<_> = group
+                            .tables()
+                            .iter()
+                            .filter(|table| self.table_matches_search(table, cx))
+                            .cloned()
+                            .collect();
+                        if visible_tables.is_empty()
+                            && !self.table_search.read(cx).value().trim().is_empty()
+                        {
+                            continue;
+                        }
+                        let view = cx.entity().downgrade();
+                        tree = tree.child(
+                            div()
+                                .id(("namespace", group_index as u64))
+                                .w_full()
+                                .px_2()
+                                .py_1()
+                                .cursor_pointer()
+                                .hover(|style| style.bg(secondary))
+                                .on_click(cx.listener({
+                                    let ns_key = ns_key.clone();
+                                    move |this, _, _, cx| {
+                                        this.toggle_namespace(&ns_key, cx);
+                                    }
+                                }))
+                                .context_menu({
+                                    let view = view.clone();
+                                    let namespace = namespace.clone();
+                                    move |menu, _, _| {
+                                        menu.item(PopupMenuItem::new("Create Table").on_click({
+                                            let view = view.clone();
+                                            let namespace = namespace.clone();
+                                            move |_, window, cx| {
+                                                view.update(cx, |this, cx| {
+                                                    this.open_create_table_form(
+                                                        namespace.clone(),
+                                                        window,
+                                                        cx,
+                                                    );
+                                                })
+                                                .ok();
+                                            }
+                                        }))
+                                    }
+                                })
+                                .child(
+                                    h_flex()
+                                        .gap_1()
+                                        .items_center()
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(muted)
+                                                .child(if collapsed { "▸" } else { "▾" }),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .child(ns_key.clone()),
+                                        ),
+                                ),
                         );
-                        for (index, table) in group.tables().iter().enumerate() {
-                            tables = tables.child(table_row(
-                                ((group_index as u64) << 16) | index as u64,
-                                table.clone(),
-                                cx,
-                            ));
+                        if !collapsed {
+                            for (index, table) in visible_tables.into_iter().enumerate() {
+                                tree = tree.child(table_tree_row(
+                                    ((group_index as u64) << 16) | index as u64,
+                                    table,
+                                    true,
+                                    cx,
+                                ));
+                            }
                         }
                     }
                 } else {
-                    tables = tables.child(
-                        Button::new("create-table")
-                            .label("Create Table")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.open_create_table_form(Namespace::main(), window, cx);
-                            })),
-                    );
-                    for (index, table) in catalog.tables().iter().enumerate() {
-                        tables = tables.child(table_row(index as u64, table.clone(), cx));
+                    let tables: Vec<_> = catalog
+                        .tables()
+                        .iter()
+                        .filter(|table| self.table_matches_search(table, cx))
+                        .cloned()
+                        .collect();
+                    if tables.is_empty() {
+                        tree = tree.child(
+                            div()
+                                .p_3()
+                                .text_color(muted)
+                                .child("No Tables match this search."),
+                        );
+                    }
+                    for (index, table) in tables.into_iter().enumerate() {
+                        tree = tree.child(table_tree_row(index as u64, table, false, cx));
                     }
                 }
             }
             Err(err) => {
-                tables = tables.child(err);
+                tree = tree.child(div().p_3().text_color(cx.theme().danger).child(err.clone()));
             }
         }
 
-        let mut staged_rows = v_flex().gap_1();
-        for (index, (change_id, label)) in staged.iter().enumerate() {
-            let change_id = *change_id;
-            staged_rows = staged_rows.child(
-                h_flex().gap_2().child(label.clone()).child(
-                    Button::new(("unstage", index as u64))
-                        .label("Unstage")
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.unstage_one(change_id, cx);
-                        })),
-                ),
+        let sidebar = v_flex()
+            .w(px(220.))
+            .h_full()
+            .border_r_1()
+            .border_color(border)
+            .child(
+                h_flex()
+                    .w_full()
+                    .px_2()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(border)
+                    .child(Input::new(&self.table_search).prefix(IconName::Search)),
+            )
+            .child(tree)
+            .child(
+                h_flex()
+                    .w_full()
+                    .px_2()
+                    .py_2()
+                    .border_t_1()
+                    .border_color(border)
+                    .child(
+                        Checkbox::new("system-catalogs")
+                            .label("Show System Catalogs")
+                            .checked(shown)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.toggle_system_catalogs(cx);
+                            })),
+                    ),
             );
+
+        let mut staged_rows = v_flex()
+            .id("staged-list")
+            .flex_1()
+            .w_full()
+            .gap_1()
+            .p_2()
+            .overflow_y_scroll();
+        if staged.is_empty() {
+            staged_rows = staged_rows.child(
+                div()
+                    .text_xs()
+                    .text_color(muted)
+                    .child("No Staged Changes."),
+            );
+        } else {
+            for (index, (change_id, icon, label)) in staged.into_iter().enumerate() {
+                staged_rows = staged_rows.child(
+                    h_flex()
+                        .id(("staged", index as u64))
+                        .w_full()
+                        .gap_2()
+                        .items_center()
+                        .px_1()
+                        .py_1()
+                        .rounded(px(4.))
+                        .hover(|style| style.bg(secondary))
+                        .child(
+                            div()
+                                .w(px(18.))
+                                .text_xs()
+                                .text_color(match icon {
+                                    'u' => rgb(0xca8a04),
+                                    'i' => rgb(0x16a34a),
+                                    _ => rgb(0xdc2626),
+                                })
+                                .child(match icon {
+                                    'u' => "✎",
+                                    'i' => "+",
+                                    _ => "⌫",
+                                }),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_xs()
+                                .text_color(foreground)
+                                .child(label),
+                        )
+                        .child(
+                            Button::new(("unstage", index as u64))
+                                .label("Unstage")
+                                .ghost()
+                                .xsmall()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.unstage_one(change_id, cx);
+                                })),
+                        ),
+                );
+            }
         }
+
+        let staged_pane = v_flex()
+            .w(px(240.))
+            .h_full()
+            .border_l_1()
+            .border_color(border)
+            .child(
+                h_flex()
+                    .w_full()
+                    .px_3()
+                    .py_2()
+                    .gap_2()
+                    .items_center()
+                    .border_b_1()
+                    .border_color(border)
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child("Staged Changes"),
+                    )
+                    .child(
+                        div()
+                            .px(px(6.))
+                            .rounded(px(999.))
+                            .bg(cx.theme().primary)
+                            .text_color(cx.theme().primary_foreground)
+                            .text_xs()
+                            .child(format!("{staged_count}")),
+                    ),
+            )
+            .child(staged_rows)
+            .child(
+                v_flex()
+                    .w_full()
+                    .gap_2()
+                    .p_2()
+                    .border_t_1()
+                    .border_color(border)
+                    .child(
+                        Button::new("apply")
+                            .primary()
+                            .w_full()
+                            .label(format!("Apply ({staged_count})"))
+                            .disabled(staged_count == 0)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.apply_changes(window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("discard-all")
+                            .w_full()
+                            .label("Discard all")
+                            .disabled(staged_count == 0)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.discard_all(cx);
+                            })),
+                    ),
+            );
 
         let tab_labels: Vec<String> = self
             .tabs
@@ -1665,9 +2067,11 @@ impl Render for SessionView {
         let mut tab_bar = TabBar::new("session-tabs")
             .menu(true)
             .selected_index(self.active_tab)
-            .prefix(
-                Button::new("new-query")
-                    .label("New Query")
+            .suffix(
+                Button::new("new-tab")
+                    .icon(IconName::Plus)
+                    .ghost()
+                    .xsmall()
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.add_query_tab(window, cx);
                     })),
@@ -1679,46 +2083,61 @@ impl Render for SessionView {
         for (index, label) in tab_labels.iter().enumerate() {
             let close_index = index;
             tab_bar = tab_bar.child(
-                Tab::new()
-                    .label(label.clone())
-                    .suffix(
-                        Button::new(("close-tab", index as u64))
-                            .icon(IconName::Close)
-                            .ghost()
-                            .xsmall()
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.close_tab(close_index, cx);
-                            })),
-                    ),
+                Tab::new().label(label.clone()).suffix(
+                    Button::new(("close-tab", index as u64))
+                        .icon(IconName::Close)
+                        .ghost()
+                        .xsmall()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.close_tab(close_index, cx);
+                        })),
+                ),
             );
         }
 
+        let (page_rows, page_index) = match self.tabs.get(self.active_tab).map(|tab| &tab.kind) {
+            Some(TabKind::Table { page, grid, .. }) | Some(TabKind::Query { page, grid, .. }) => (
+                grid.as_ref()
+                    .map(|state| state.read(cx).delegate().rows.len())
+                    .unwrap_or(0),
+                page.index() + 1,
+            ),
+            _ => (0, 1),
+        };
+        let status_left = if self.status.is_empty() {
+            format!("{page_rows} rows · page {page_index} · {staged_count} Staged Changes")
+                .into()
+        } else {
+            self.status.clone()
+        };
+
+        let center = v_flex()
+            .flex_1()
+            .h_full()
+            .min_w_0()
+            .child(
+                h_flex()
+                    .w_full()
+                    .border_b_1()
+                    .border_color(border)
+                    .child(tab_bar),
+            )
+            .child(self.render_active_tab(window, cx));
+
         v_flex()
             .size_full()
-            .p_5()
-            .gap_3()
             .bg(cx.theme().background)
-            .child(title)
+            .text_color(foreground)
+            .child(h_flex().flex_1().w_full().min_h_0().child(sidebar).child(center).child(staged_pane))
             .child(
-                Button::new("system-catalogs")
-                    .label(if shown {
-                        "Hide System Catalogs"
-                    } else {
-                        "Show System Catalogs"
-                    })
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_system_catalogs(cx))),
+                h_flex()
+                    .w_full()
+                    .px_3()
+                    .py_1()
+                    .border_t_1()
+                    .border_color(border)
+                    .child(div().text_xs().text_color(muted).child(status_left)),
             )
-            .child(
-                h_flex().size_full().gap_4().child(tables).child(
-                    v_flex()
-                        .flex_1()
-                        .gap_2()
-                        .child(tab_bar)
-                        .child(self.render_active_tab(window, cx))
-                        .child(staged_rows),
-                ),
-            )
-            .child(self.status.clone())
     }
 }
 
@@ -1739,25 +2158,71 @@ fn table_label(table: &Table) -> String {
     }
 }
 
-fn table_row(index: u64, table: Table, cx: &mut Context<SessionView>) -> impl IntoElement {
+fn table_tree_row(
+    index: u64,
+    table: Table,
+    indented: bool,
+    cx: &mut Context<SessionView>,
+) -> impl IntoElement {
     let for_structure = table.clone();
-    h_flex()
-        .gap_1()
-        .child(
-            Button::new(("table", index))
-                .label(table.name().as_str().to_string())
-                .on_click(cx.listener({
+    let name = table.name().as_str().to_string();
+    let secondary = cx.theme().secondary;
+    let view = cx.entity().downgrade();
+    div()
+        .id(("table", index))
+        .w_full()
+        .px_2()
+        .when(indented, |row| row.pl_6())
+        .py_1()
+        .cursor_pointer()
+        .hover(move |style| style.bg(secondary))
+        .on_click(cx.listener({
+            let table = table.clone();
+            move |this, _, window, cx| {
+                this.add_table_tab(table.clone(), window, cx);
+            }
+        }))
+        .context_menu({
+            let view = view.clone();
+            let table = table.clone();
+            let for_structure = for_structure.clone();
+            move |menu, _, _| {
+                menu.item(PopupMenuItem::new("Open").on_click({
+                    let view = view.clone();
                     let table = table.clone();
-                    move |this, _, window, cx| {
-                        this.add_table_tab(table.clone(), window, cx);
+                    move |_, window, cx| {
+                        view.update(cx, |this, cx| {
+                            this.add_table_tab(table.clone(), window, cx);
+                        })
+                        .ok();
                     }
-                })),
-        )
-        .child(Button::new(("structure", index)).label("Structure").on_click(
-            cx.listener(move |this, _, window, cx| {
-                this.add_structure_tab(for_structure.clone(), window, cx);
-            }),
-        ))
+                }))
+                .item(PopupMenuItem::new("Structure").on_click({
+                    let view = view.clone();
+                    let for_structure = for_structure.clone();
+                    move |_, window, cx| {
+                        view.update(cx, |this, cx| {
+                            this.add_structure_tab(for_structure.clone(), window, cx);
+                        })
+                        .ok();
+                    }
+                }))
+                .item(PopupMenuItem::new("Create Table").on_click({
+                    let view = view.clone();
+                    let namespace = table
+                        .namespace()
+                        .cloned()
+                        .unwrap_or_else(Namespace::main);
+                    move |_, window, cx| {
+                        view.update(cx, |this, cx| {
+                            this.open_create_table_form(namespace.clone(), window, cx);
+                        })
+                        .ok();
+                    }
+                }))
+            }
+        })
+        .child(div().text_sm().child(name))
 }
 
 fn truncate_label(text: &str, max_chars: usize) -> String {
@@ -1836,12 +2301,43 @@ fn cell_from_input(original: &Cell, text: &str) -> Cell {
     }
 }
 
+fn change_kind_icon(change: &StagedChange) -> char {
+    match change {
+        StagedChange::Insert { .. } => 'i',
+        StagedChange::Update { .. } => 'u',
+        StagedChange::Delete { .. } => 'd',
+    }
+}
+
 fn change_label(change: &StagedChange) -> String {
     match change {
-        StagedChange::Insert { table, .. } => format!("Insert into {}", table_label(table)),
-        StagedChange::Update { table, .. } => format!("Update {}", table_label(table)),
-        StagedChange::Delete { table, .. } => format!("Delete from {}", table_label(table)),
+        StagedChange::Insert { table, .. } => {
+            format!("insert {}", table.name().as_str())
+        }
+        StagedChange::Update {
+            table, identity, ..
+        } => format!(
+            "update {} · {}",
+            table.name().as_str(),
+            identity_label(identity)
+        ),
+        StagedChange::Delete {
+            table, identity, ..
+        } => format!(
+            "delete {} · {}",
+            table.name().as_str(),
+            identity_label(identity)
+        ),
     }
+}
+
+fn identity_label(identity: &RowIdentity) -> String {
+    identity
+        .columns()
+        .iter()
+        .map(|(column, cell)| format!("{} {}", column.as_str(), cell_label(cell)))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn filter_label(filter: &Filter) -> String {
