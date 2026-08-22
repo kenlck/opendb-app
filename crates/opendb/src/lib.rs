@@ -14,6 +14,8 @@ mod table_page;
 mod table_structure;
 
 pub use catalog::SystemCatalogPreference;
+// Namespace picker helpers for Session chrome (TablePlus-style schema control).
+pub use catalog::{default_namespace, tables_in_namespace};
 pub use client::{CatalogError, Client, CloseResult, OpenError, PreferenceError, SessionId};
 pub use connection::Connection;
 pub use connection_string::{ConnectionString, Engine, ParseError};

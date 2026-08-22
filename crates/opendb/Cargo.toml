@@ -13,6 +13,7 @@ postgres.workspace = true
 mysql.workspace = true
 thiserror.workspace = true
 url.workspace = true
+bytes = "1"
 
 [dev-dependencies]
 tempfile.workspace = true

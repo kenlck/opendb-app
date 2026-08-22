@@ -92,6 +92,14 @@ pub struct TablePage {
 }
 
 impl TablePage {
+    pub fn empty() -> Self {
+        Self {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            has_next: false,
+        }
+    }
+
     pub(crate) fn from_fetched(columns: Vec<ColumnName>, mut rows: Vec<Vec<Cell>>) -> Self {
         let has_next = rows.len() > TABLE_PAGE_SIZE;
         if has_next {

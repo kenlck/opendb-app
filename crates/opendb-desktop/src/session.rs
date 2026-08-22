@@ -1,5 +1,3 @@
-use std::collections::HashSet;
-
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants};
@@ -13,7 +11,7 @@ use gpui_component::{ActiveTheme, Disableable, IconName, Sizable, WindowExt, h_f
 use opendb::{
     Cell, Client, ColumnDefinition, ColumnName, Filter, Namespace, Page, ResultStaging, RowIdentity,
     SchemaChange, SessionId, SqlKind, StagedChange, StagedChangeId, SystemCatalogPreference, Table,
-    TableName, TablePage, TABLE_PAGE_SIZE,
+    TableCatalog, TableName, TablePage, TABLE_PAGE_SIZE, default_namespace, tables_in_namespace,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -215,7 +213,7 @@ pub struct SessionView {
     active_tab: usize,
     next_tab_id: u64,
     table_search: Entity<InputState>,
-    collapsed_namespaces: HashSet<String>,
+    selected_namespace: Option<Namespace>,
     column_input: Entity<InputState>,
     value_input: Entity<InputState>,
     edit_input: Entity<InputState>,
@@ -288,7 +286,7 @@ impl SessionView {
             active_tab: 0,
             next_tab_id: 1,
             table_search,
-            collapsed_namespaces: HashSet::new(),
+            selected_namespace: None,
             column_input,
             value_input,
             edit_input,
@@ -371,6 +369,8 @@ impl SessionView {
         if let Err(err) = result {
             self.status = format!("{err}").into();
         }
+        // Selection may point at a now-hidden system Namespace; next render resets it.
+        self.selected_namespace = None;
         cx.notify();
     }
 
@@ -647,23 +647,27 @@ impl SessionView {
         });
     }
 
-    fn toggle_namespace(&mut self, namespace: &str, cx: &mut Context<Self>) {
-        if self.collapsed_namespaces.contains(namespace) {
-            self.collapsed_namespaces.remove(namespace);
-        } else {
-            self.collapsed_namespaces.insert(namespace.to_string());
-        }
+    fn select_namespace(&mut self, namespace: Namespace, cx: &mut Context<Self>) {
+        self.selected_namespace = Some(namespace);
         cx.notify();
     }
 
-    fn table_matches_search(&self, table: &Table, cx: &App) -> bool {
-        let query = self.table_search.read(cx).value().trim().to_lowercase();
-        if query.is_empty() {
-            return true;
+    fn current_namespace_for_create(&self, catalog: &TableCatalog) -> Namespace {
+        if let Some(selected) = &self.selected_namespace {
+            return selected.clone();
         }
-        let name = table.name().as_str().to_lowercase();
-        let full = table_label(table).to_lowercase();
-        name.contains(&query) || full.contains(&query)
+        default_namespace(
+            catalog
+                .namespace_groups()
+                .into_iter()
+                .flatten()
+                .map(|group| group.namespace()),
+        )
+        .unwrap_or_else(Namespace::main)
+    }
+
+    fn table_search_query(&self, cx: &App) -> String {
+        self.table_search.read(cx).value().trim().to_string()
     }
 
     fn active_table(&self) -> Option<Table> {
@@ -1020,7 +1024,34 @@ impl SessionView {
         };
 
         match loaded {
-            Err(err) => self.status = err.into(),
+            Err(err) => {
+                let empty = TablePage::empty();
+                let mut grid = match self.tabs.get_mut(active).map(|tab| &mut tab.kind) {
+                    Some(TabKind::Table { has_next, grid, .. }) => {
+                        *has_next = false;
+                        grid.take()
+                    }
+                    Some(TabKind::Query {
+                        has_next,
+                        grid,
+                        ..
+                    }) => {
+                        *has_next = false;
+                        grid.take()
+                    }
+                    _ => None,
+                };
+                self.show_page(empty, false, &mut grid, window, cx);
+                if let Some(tab) = self.tabs.get_mut(active) {
+                    match &mut tab.kind {
+                        TabKind::Table { grid: slot, .. } | TabKind::Query { grid: slot, .. } => {
+                            *slot = grid;
+                        }
+                        TabKind::Structure { .. } => {}
+                    }
+                }
+                self.status = err.into();
+            }
             Ok((page_data, editable, staging)) => {
                 let mut grid = match self.tabs.get_mut(active).map(|tab| &mut tab.kind) {
                     Some(TabKind::Table { has_next, grid, .. }) => {
@@ -1790,6 +1821,7 @@ impl Render for SessionView {
         let foreground = cx.theme().foreground;
 
         let mut tree = v_flex().id("table-tree").flex_1().w_full().gap_0().overflow_y_scroll();
+        let mut schema_picker: Option<AnyElement> = None;
         match &catalog {
             Ok(catalog) if catalog.tables().is_empty() => {
                 tree = tree.child(
@@ -1800,91 +1832,135 @@ impl Render for SessionView {
                 );
             }
             Ok(catalog) => {
-                if let Some(groups) = catalog.namespace_groups() {
-                    for (group_index, group) in groups.iter().enumerate() {
-                        let namespace = group.namespace().clone();
-                        let ns_key = namespace.as_str().to_string();
-                        let collapsed = self.collapsed_namespaces.contains(&ns_key);
-                        let visible_tables: Vec<_> = group
-                            .tables()
-                            .iter()
-                            .filter(|table| self.table_matches_search(table, cx))
-                            .cloned()
-                            .collect();
-                        if visible_tables.is_empty()
-                            && !self.table_search.read(cx).value().trim().is_empty()
-                        {
-                            continue;
+                if catalog.is_grouped() {
+                    // Borrow checker: ensure selection against this catalog snapshot.
+                    let selected = {
+                        let groups = catalog.namespace_groups().unwrap_or(&[]);
+                        let still_valid = self
+                            .selected_namespace
+                            .as_ref()
+                            .is_some_and(|selected| {
+                                groups.iter().any(|group| group.namespace() == selected)
+                            });
+                        if !still_valid {
+                            self.selected_namespace =
+                                default_namespace(groups.iter().map(|group| group.namespace()));
                         }
-                        let view = cx.entity().downgrade();
+                        self.selected_namespace.clone()
+                    };
+                    let query = self.table_search_query(cx);
+                    let tables = match &selected {
+                        Some(namespace) => tables_in_namespace(catalog, namespace, &query)
+                            .into_iter()
+                            .cloned()
+                            .collect::<Vec<_>>(),
+                        None => Vec::new(),
+                    };
+                    if tables.is_empty() {
                         tree = tree.child(
                             div()
-                                .id(("namespace", group_index as u64))
-                                .w_full()
-                                .px_2()
-                                .py_1()
-                                .cursor_pointer()
-                                .hover(|style| style.bg(secondary))
-                                .on_click(cx.listener({
-                                    let ns_key = ns_key.clone();
-                                    move |this, _, _, cx| {
-                                        this.toggle_namespace(&ns_key, cx);
-                                    }
-                                }))
-                                .context_menu({
-                                    let view = view.clone();
-                                    let namespace = namespace.clone();
-                                    move |menu, _, _| {
-                                        menu.item(PopupMenuItem::new("Create Table").on_click({
-                                            let view = view.clone();
-                                            let namespace = namespace.clone();
-                                            move |_, window, cx| {
-                                                view.update(cx, |this, cx| {
-                                                    this.open_create_table_form(
-                                                        namespace.clone(),
-                                                        window,
-                                                        cx,
-                                                    );
-                                                })
-                                                .ok();
-                                            }
-                                        }))
-                                    }
-                                })
-                                .child(
-                                    h_flex()
-                                        .gap_1()
-                                        .items_center()
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(muted)
-                                                .child(if collapsed { "▸" } else { "▾" }),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_sm()
-                                                .font_weight(FontWeight::MEDIUM)
-                                                .child(ns_key.clone()),
-                                        ),
-                                ),
+                                .p_3()
+                                .text_color(muted)
+                                .child(if query.trim().is_empty() {
+                                    "No Tables in this schema."
+                                } else {
+                                    "No Tables match this search."
+                                }),
                         );
-                        if !collapsed {
-                            for (index, table) in visible_tables.into_iter().enumerate() {
-                                tree = tree.child(table_tree_row(
-                                    ((group_index as u64) << 16) | index as u64,
-                                    table,
-                                    true,
-                                    cx,
-                                ));
-                            }
-                        }
                     }
+                    for (index, table) in tables.into_iter().enumerate() {
+                        tree = tree.child(table_tree_row(index as u64, table, false, cx));
+                    }
+
+                    let namespaces: Vec<Namespace> = catalog
+                        .namespace_groups()
+                        .unwrap_or(&[])
+                        .iter()
+                        .map(|group| group.namespace().clone())
+                        .collect();
+                    let selected_label = selected
+                        .as_ref()
+                        .map(|namespace| namespace.as_str().to_string())
+                        .unwrap_or_else(|| "Schema".into());
+                    let view = cx.entity().downgrade();
+                    let create_namespace = selected
+                        .clone()
+                        .unwrap_or_else(|| self.current_namespace_for_create(catalog));
+                    schema_picker = Some(
+                        h_flex()
+                            .w_full()
+                            .px_2()
+                            .py_2()
+                            .gap_1()
+                            .border_t_1()
+                            .border_color(border)
+                            .items_center()
+                            .child(
+                                Button::new("schema-picker")
+                                    .label(format!("✓ {selected_label}"))
+                                    .w_full()
+                                    .dropdown_menu({
+                                        let namespaces = namespaces.clone();
+                                        let selected = selected.clone();
+                                        let view = view.clone();
+                                        move |menu, _, _| {
+                                            let mut menu = menu;
+                                            for namespace in namespaces.iter() {
+                                                let label = if selected.as_ref() == Some(namespace)
+                                                {
+                                                    format!("✓ {}", namespace.as_str())
+                                                } else {
+                                                    format!("  {}", namespace.as_str())
+                                                };
+                                                let namespace = namespace.clone();
+                                                let view = view.clone();
+                                                menu = menu.item(
+                                                    PopupMenuItem::new(label).on_click(move |_, _, cx| {
+                                                        view.update(cx, |this, cx| {
+                                                            this.select_namespace(
+                                                                namespace.clone(),
+                                                                cx,
+                                                            );
+                                                        })
+                                                        .ok();
+                                                    }),
+                                                );
+                                            }
+                                            menu
+                                        }
+                                    }),
+                            )
+                            .child(
+                                Button::new("create-table-sidebar")
+                                    .label("+")
+                                    .ghost()
+                                    .xsmall()
+                                    .on_click(cx.listener({
+                                        let namespace = create_namespace;
+                                        move |this, _, window, cx| {
+                                            this.open_create_table_form(
+                                                namespace.clone(),
+                                                window,
+                                                cx,
+                                            );
+                                        }
+                                    })),
+                            )
+                            .into_any_element(),
+                    );
                 } else {
+                    let query = self.table_search_query(cx).to_ascii_lowercase();
                     let tables: Vec<_> = catalog
                         .tables()
                         .iter()
-                        .filter(|table| self.table_matches_search(table, cx))
+                        .filter(|table| {
+                            query.is_empty()
+                                || table
+                                    .name()
+                                    .as_str()
+                                    .to_ascii_lowercase()
+                                    .contains(&query)
+                        })
                         .cloned()
                         .collect();
                     if tables.is_empty() {
@@ -1905,7 +1981,7 @@ impl Render for SessionView {
             }
         }
 
-        let sidebar = v_flex()
+        let mut sidebar = v_flex()
             .w(px(220.))
             .h_full()
             .border_r_1()
@@ -1919,23 +1995,26 @@ impl Render for SessionView {
                     .border_color(border)
                     .child(Input::new(&self.table_search).prefix(IconName::Search)),
             )
-            .child(tree)
-            .child(
-                h_flex()
-                    .w_full()
-                    .px_2()
-                    .py_2()
-                    .border_t_1()
-                    .border_color(border)
-                    .child(
-                        Checkbox::new("system-catalogs")
-                            .label("Show System Catalogs")
-                            .checked(shown)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.toggle_system_catalogs(cx);
-                            })),
-                    ),
-            );
+            .child(tree);
+        if let Some(picker) = schema_picker {
+            sidebar = sidebar.child(picker);
+        }
+        sidebar = sidebar.child(
+            h_flex()
+                .w_full()
+                .px_2()
+                .py_2()
+                .border_t_1()
+                .border_color(border)
+                .child(
+                    Checkbox::new("system-catalogs")
+                        .label("Show System Catalogs")
+                        .checked(shown)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.toggle_system_catalogs(cx);
+                        })),
+                ),
+        );
 
         let mut staged_rows = v_flex()
             .id("staged-list")
