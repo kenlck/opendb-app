@@ -1,14 +1,19 @@
+mod session;
+
 use std::fs;
 
 use directories::ProjectDirs;
+use gpui::prelude::FluentBuilder;
 use gpui::*;
-use gpui_component::button::Button;
+use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputState};
 use gpui_component::{ActiveTheme, Root, h_flex, v_flex};
 use gpui_component_assets::Assets;
-use opendb::{AddResult, Connection, ConnectionList, ConnectionString, FileStore};
+use opendb::{AddResult, Client, Connection, ConnectionList, ConnectionString, FileStore};
+use session::SessionView;
 
 pub struct ConnectionListView {
+    client: Entity<Client>,
     store: FileStore,
     list: ConnectionList,
     paste: Entity<InputState>,
@@ -17,12 +22,13 @@ pub struct ConnectionListView {
 }
 
 impl ConnectionListView {
-    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(client: Entity<Client>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let store = FileStore::new(store_path());
         let list = store.load().unwrap_or_else(|_| ConnectionList::new());
         let paste =
             cx.new(|cx| InputState::new(window, cx).placeholder("Paste a Connection String"));
         Self {
+            client,
             store,
             list,
             paste,
@@ -112,6 +118,36 @@ impl ConnectionListView {
         self.status = "Connection String copied.".into();
         cx.notify();
     }
+
+    fn open_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(index) = self.selected else {
+            self.status = "Pick a Connection first.".into();
+            cx.notify();
+            return;
+        };
+        let connection = self.list.connections()[index].clone();
+        let opened = self
+            .client
+            .update(cx, |client, _cx| client.open_session(&connection));
+        match opened {
+            Ok(session_id) => {
+                let client = self.client.clone();
+                let name = connection.name().as_str().to_string();
+                let options = session_window_options(&name, cx);
+                if let Err(err) = cx.open_window(options, |window, cx| {
+                    let view = cx.new(|cx| SessionView::new(client, session_id, window, cx));
+                    cx.new(|cx| Root::new(view, window, cx))
+                }) {
+                    self.status = format!("{err}").into();
+                    cx.notify();
+                }
+            }
+            Err(err) => {
+                self.status = format!("{err}").into();
+                cx.notify();
+            }
+        }
+    }
 }
 
 impl Render for ConnectionListView {
@@ -147,6 +183,11 @@ impl Render for ConnectionListView {
                             .on_click(cx.listener(|this, _, window, cx| this.add(window, cx))),
                     )
                     .child(
+                        Button::new("open")
+                            .label("Open")
+                            .on_click(cx.listener(|this, _, _, cx| this.open_selected(cx))),
+                    )
+                    .child(
                         Button::new("export")
                             .label("Export")
                             .on_click(cx.listener(|this, _, _, cx| this.export(cx))),
@@ -167,9 +208,28 @@ impl Render for ConnectionListView {
     }
 }
 
-fn store_path() -> std::path::PathBuf {
+fn app_data_dir() -> std::path::PathBuf {
     let dirs = ProjectDirs::from("dev", "OpenDB", "opendb").expect("app data directory");
-    dirs.data_dir().join("connection-list.json")
+    dirs.data_dir().to_path_buf()
+}
+
+fn store_path() -> std::path::PathBuf {
+    app_data_dir().join("connection-list.json")
+}
+
+fn preferences_path() -> std::path::PathBuf {
+    app_data_dir().join("preferences.json")
+}
+
+fn session_window_options(name: &str, cx: &App) -> WindowOptions {
+    WindowOptions {
+        window_bounds: Some(WindowBounds::centered(size(px(960.), px(720.)), cx)),
+        titlebar: Some(TitlebarOptions {
+            title: Some(name.into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
 }
 
 fn main() {
@@ -186,7 +246,9 @@ fn main() {
         };
         cx.spawn(async move |cx| {
             cx.open_window(window_options, |window, cx| {
-                let view = cx.new(|cx| ConnectionListView::new(window, cx));
+                let client =
+                    cx.new(|_cx| Client::open(preferences_path()).expect("Client preferences"));
+                let view = cx.new(|cx| ConnectionListView::new(client, window, cx));
                 cx.new(|cx| Root::new(view, window, cx))
             })
             .expect("Failed to open window");
